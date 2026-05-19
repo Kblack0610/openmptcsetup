@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# vps-create-do.sh — provision the OMR VPS on DigitalOcean via doctl.
+#
+# Prereqs:
+#   • doctl installed and authenticated (you already have do-nyc3 cluster auth)
+#   • ./bootstrap.sh has been run (generates ~/.ssh/omr_vps)
+#
+# Creates: a $6/mo Debian 12 droplet in SFO3 with the omr_vps SSH key.
+# Outputs: writes VPS_IP to ./.env, ready for ./vps-install.sh
+#
+# Usage: ./vps-create-do.sh
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SSH_KEY="${HOME}/.ssh/omr_vps"
+ENV_FILE="${SCRIPT_DIR}/.env"
+
+DROPLET_NAME="omr-sfo3"
+DROPLET_REGION="sfo3"
+DROPLET_SIZE="s-1vcpu-1gb"     # $6/mo
+DROPLET_IMAGE="debian-12-x64"
+SSH_KEY_NAME="omr-vps"
+
+c_blue()  { printf '\033[1;34m%s\033[0m\n' "$*"; }
+c_green() { printf '\033[1;32m%s\033[0m\n' "$*"; }
+c_yellow(){ printf '\033[1;33m%s\033[0m\n' "$*"; }
+c_red()   { printf '\033[1;31m%s\033[0m\n' "$*" >&2; }
+step() { c_blue "=== $* ==="; }
+ok()   { c_green "  ✓ $*"; }
+warn() { c_yellow "  ! $*"; }
+fail() { c_red "  ✗ $*"; exit 1; }
+
+# ──────────────────────────────────────────────────────────────
+# Sanity checks
+# ──────────────────────────────────────────────────────────────
+step "Checking prerequisites"
+
+command -v doctl &>/dev/null || fail "doctl not installed"
+ok "doctl present"
+
+if ! doctl account get &>/dev/null; then
+  fail "doctl is not authenticated. Run: doctl auth init"
+fi
+ACCOUNT_EMAIL=$(doctl account get --format Email --no-header 2>/dev/null || echo "unknown")
+ok "doctl authenticated (${ACCOUNT_EMAIL})"
+
+if [[ ! -f "${SSH_KEY}.pub" ]]; then
+  fail "${SSH_KEY}.pub not found — run ./bootstrap.sh first"
+fi
+ok "Found local SSH key ${SSH_KEY}.pub"
+
+# ──────────────────────────────────────────────────────────────
+# Upload (or find existing) SSH key in DigitalOcean
+# ──────────────────────────────────────────────────────────────
+step "Registering SSH key with DigitalOcean"
+
+LOCAL_FINGERPRINT=$(ssh-keygen -lf "${SSH_KEY}.pub" | awk '{print $2}' | sed 's/^SHA256://')
+# DO stores MD5 fingerprints — compute that too
+MD5_FP=$(ssh-keygen -E md5 -lf "${SSH_KEY}.pub" | awk '{print $2}' | sed 's/^MD5://')
+
+EXISTING_KEY_ID=$(doctl compute ssh-key list --format ID,FingerPrint --no-header 2>/dev/null \
+  | grep -F "${MD5_FP}" | awk '{print $1}' | head -1)
+
+if [[ -n "${EXISTING_KEY_ID}" ]]; then
+  ok "Key already registered in DO (ID: ${EXISTING_KEY_ID})"
+  SSH_KEY_ID="${EXISTING_KEY_ID}"
+else
+  warn "Key not in DO — importing as '${SSH_KEY_NAME}'"
+  SSH_KEY_ID=$(doctl compute ssh-key import "${SSH_KEY_NAME}" \
+    --public-key-file "${SSH_KEY}.pub" \
+    --format ID --no-header)
+  ok "Imported (ID: ${SSH_KEY_ID})"
+fi
+
+# ──────────────────────────────────────────────────────────────
+# Check if droplet already exists
+# ──────────────────────────────────────────────────────────────
+step "Checking for existing droplet '${DROPLET_NAME}'"
+
+EXISTING_DROPLET=$(doctl compute droplet list --format ID,Name --no-header 2>/dev/null \
+  | awk -v name="${DROPLET_NAME}" '$2 == name {print $1}' | head -1)
+
+if [[ -n "${EXISTING_DROPLET}" ]]; then
+  warn "Droplet '${DROPLET_NAME}' already exists (ID: ${EXISTING_DROPLET})"
+  EXISTING_IP=$(doctl compute droplet get "${EXISTING_DROPLET}" --format PublicIPv4 --no-header)
+  warn "Public IP: ${EXISTING_IP}"
+  read -rp "Use this existing droplet? [Y/n] " yn
+  yn="${yn:-y}"
+  if [[ "${yn,,}" == "y" ]]; then
+    VPS_IP="${EXISTING_IP}"
+    DROPLET_ID="${EXISTING_DROPLET}"
+  else
+    fail "Aborted by user — delete the existing droplet first or pick a new name"
+  fi
+else
+  ok "No existing droplet — proceeding to create"
+
+  # ─────────────────────────────────────────────────────────────
+  # Cost confirmation
+  # ─────────────────────────────────────────────────────────────
+  cat <<EOF
+
+About to create:
+  Name:    ${DROPLET_NAME}
+  Region:  ${DROPLET_REGION}  (San Francisco 3, ~15-25 ms from SoCal)
+  Size:    ${DROPLET_SIZE}    (\$6/mo — 1 vCPU, 1 GB RAM, 25 GB SSD, 1 TB transfer)
+  Image:   ${DROPLET_IMAGE}
+  SSH key: ${SSH_KEY_NAME} (ID: ${SSH_KEY_ID})
+
+EOF
+  read -rp "Proceed? [y/N] " yn
+  [[ "${yn,,}" == "y" ]] || { warn "Aborted"; exit 0; }
+
+  # ─────────────────────────────────────────────────────────────
+  # Create the droplet
+  # ─────────────────────────────────────────────────────────────
+  step "Creating droplet (this takes ~60s)"
+  DROPLET_ID=$(doctl compute droplet create "${DROPLET_NAME}" \
+    --region "${DROPLET_REGION}" \
+    --size "${DROPLET_SIZE}" \
+    --image "${DROPLET_IMAGE}" \
+    --ssh-keys "${SSH_KEY_ID}" \
+    --enable-ipv6 \
+    --enable-monitoring \
+    --tag-names "omr,bonding-vps" \
+    --wait \
+    --format ID --no-header)
+  ok "Droplet created (ID: ${DROPLET_ID})"
+
+  VPS_IP=$(doctl compute droplet get "${DROPLET_ID}" --format PublicIPv4 --no-header)
+  ok "Public IPv4: ${VPS_IP}"
+fi
+
+# ──────────────────────────────────────────────────────────────
+# Save VPS_IP to .env
+# ──────────────────────────────────────────────────────────────
+step "Writing ${ENV_FILE}"
+{
+  echo "# Generated by vps-create-do.sh on $(date -Iseconds)"
+  echo "VPS_IP=${VPS_IP}"
+  echo "VPS_PROVIDER=digitalocean"
+  echo "VPS_DROPLET_ID=${DROPLET_ID}"
+  echo "VPS_REGION=${DROPLET_REGION}"
+} > "${ENV_FILE}"
+ok "Saved to ${ENV_FILE}"
+
+# ──────────────────────────────────────────────────────────────
+# Wait for SSH to come up
+# ──────────────────────────────────────────────────────────────
+step "Waiting for SSH on port 22"
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  if ssh -i "${SSH_KEY}" -p 22 \
+       -o ConnectTimeout=5 \
+       -o StrictHostKeyChecking=accept-new \
+       -o UserKnownHostsFile=/dev/null \
+       "root@${VPS_IP}" "true" 2>/dev/null; then
+    ok "SSH ready"
+    break
+  fi
+  warn "Attempt $i — SSH not ready yet, waiting 10s..."
+  sleep 10
+  if [[ "$i" == "10" ]]; then
+    fail "SSH never came up — check the DO console: doctl compute droplet get ${DROPLET_ID}"
+  fi
+done
+
+# ──────────────────────────────────────────────────────────────
+# Done — offer to chain into vps-install.sh
+# ──────────────────────────────────────────────────────────────
+cat <<EOF
+
+$(c_green '════════════════════════════════════════════════════════════')
+$(c_green '  DigitalOcean droplet ready')
+$(c_green '════════════════════════════════════════════════════════════')
+
+  Name:      ${DROPLET_NAME}
+  Region:    ${DROPLET_REGION}
+  Public IP: ${VPS_IP}
+  SSH:       ssh -i ${SSH_KEY} root@${VPS_IP}
+
+EOF
+
+read -rp "Run ./vps-install.sh now to install the OMR server? [Y/n] " yn
+yn="${yn:-y}"
+if [[ "${yn,,}" == "y" ]]; then
+  exec "${SCRIPT_DIR}/vps-install.sh"
+else
+  cat <<EOF
+Next step when you're ready:
+  ./vps-install.sh
+
+To tear down the droplet later:
+  doctl compute droplet delete ${DROPLET_ID}
+EOF
+fi

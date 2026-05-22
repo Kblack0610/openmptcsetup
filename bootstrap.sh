@@ -56,32 +56,31 @@ RELEASE_URL="${OMR_RELEASE_BASE}/${LATEST_DIR}"
 # ──────────────────────────────────────────────────────────────
 # 3. Find the Beryl AX (GL-MT3000) sysupgrade image
 # ──────────────────────────────────────────────────────────────
+# OMR's release layout for GL.iNet devices is:
+#   /v{VER}/gl-mt3000/targets/mediatek/filogic/openmptcprouter-*-glinet_gl-mt3000-squashfs-sysupgrade.bin
 step "Locating GL-MT3000 (Beryl AX) sysupgrade image"
-LISTING=$(curl -fsSL "${RELEASE_URL}/")
+TARGET_URL="${RELEASE_URL}/gl-mt3000/targets/mediatek/filogic"
+LISTING=$(curl -fsSL "${TARGET_URL}/" || true)
 
-IMAGE_NAME=$(echo "${LISTING}" \
-  | grep -oE 'href="[^"]*glinet[_-]gl-mt3000[^"]*sysupgrade[^"]*"' \
-  | sed -E 's/href="([^"]+)"/\1/' \
-  | head -1)
-
-if [[ -z "${IMAGE_NAME}" ]]; then
-  # Try alternate naming (some OMR releases use "mt3000" without "gl-")
-  IMAGE_NAME=$(echo "${LISTING}" \
-    | grep -oE 'href="[^"]*mt3000[^"]*sysupgrade[^"]*"' \
-    | sed -E 's/href="([^"]+)"/\1/' \
-    | head -1)
+if [[ -z "${LISTING}" ]]; then
+  fail "Could not fetch ${TARGET_URL}/ — check your internet or OMR release dir"
 fi
 
+# grep returning no match is OK; capture in a way that doesn't kill -e/pipefail
+IMAGE_NAME=$(printf '%s' "${LISTING}" \
+  | grep -oE 'openmptcprouter-[^"]*glinet_gl-mt3000-squashfs-sysupgrade\.bin' \
+  | head -1 || true)
+
 if [[ -z "${IMAGE_NAME}" ]]; then
-  c_red "Could not auto-find an MT3000 sysupgrade image in ${RELEASE_URL}/"
-  c_red "Available files matching 'mt3000' or 'glinet':"
-  echo "${LISTING}" | grep -oE 'href="[^"]*(mt3000|glinet)[^"]*"' | sed -E 's/href="([^"]+)"/  \1/' | sort -u >&2
-  fail "Manual download required — see ${RELEASE_URL}/"
+  c_red "Could not find a sysupgrade image at ${TARGET_URL}/"
+  c_red "Files available:"
+  printf '%s' "${LISTING}" | grep -oE 'href="[^"]*\.bin"' | sed -E 's/href="(.+)"/  \1/' | sort -u >&2 || true
+  fail "Open ${TARGET_URL}/ in a browser to check the layout"
 fi
 ok "Found image: ${IMAGE_NAME}"
 
 # ──────────────────────────────────────────────────────────────
-# 4. Download image + checksums
+# 4. Download image + per-file checksum
 # ──────────────────────────────────────────────────────────────
 step "Downloading firmware to ${FIRMWARE_DIR}"
 mkdir -p "${FIRMWARE_DIR}"
@@ -90,28 +89,25 @@ cd "${FIRMWARE_DIR}"
 if [[ -f "${IMAGE_NAME}" ]]; then
   warn "Image already downloaded, skipping"
 else
-  wget -q --show-progress "${RELEASE_URL}/${IMAGE_NAME}"
+  wget -q --show-progress "${TARGET_URL}/${IMAGE_NAME}"
   ok "Downloaded ${IMAGE_NAME}"
 fi
 
-# Find the checksum file (varies: sha256sums, SHA256SUMS, etc.)
-CHECKSUM_FILE=$(echo "${LISTING}" \
-  | grep -oE 'href="(sha256sums?|SHA256SUMS)"' \
-  | sed -E 's/href="([^"]+)"/\1/' \
-  | head -1)
+# OMR ships a per-file .sha256sum (not a combined sha256sums file)
+CHECKSUM_FILE="${IMAGE_NAME}.sha256sum"
+if [[ ! -f "${CHECKSUM_FILE}" ]]; then
+  wget -q "${TARGET_URL}/${CHECKSUM_FILE}" || warn "No .sha256sum companion file — skipping verification"
+fi
 
-if [[ -n "${CHECKSUM_FILE}" ]]; then
-  if [[ ! -f "${CHECKSUM_FILE}" ]]; then
-    wget -q "${RELEASE_URL}/${CHECKSUM_FILE}"
-  fi
+if [[ -f "${CHECKSUM_FILE}" ]]; then
   step "Verifying SHA256"
-  if grep -F "${IMAGE_NAME}" "${CHECKSUM_FILE}" | sha256sum -c -; then
+  if sha256sum -c "${CHECKSUM_FILE}"; then
     ok "Checksum verified"
   else
     fail "Checksum verification FAILED — do not flash this image"
   fi
 else
-  warn "No checksum file found at ${RELEASE_URL}/ — proceed at your own risk"
+  warn "Skipped checksum verification"
 fi
 
 # ──────────────────────────────────────────────────────────────
@@ -137,25 +133,23 @@ $(c_green '═══════════════════════
 Firmware ready at:
   ${FIRMWARE_DIR}/${IMAGE_NAME}
 
-SSH public key (paste into Vultr when deploying the VPS):
+SSH public key (already on disk; vps-create-do.sh will upload it for you):
   $(cat "${SSH_KEY}.pub")
 
 ────────────────────────────────────────────────────────────
 Next steps:
 ────────────────────────────────────────────────────────────
 
-1. Provision a VPS at Vultr (or alternative — see VPS-options.md):
-   https://my.vultr.com → Deploy New Server
-   • Cloud Compute, Los Angeles, Debian 12, \$6/mo plan
-   • Paste the SSH public key above
+1. Create the VPS on DigitalOcean (uses your existing doctl auth):
+   ./vps-create-do.sh
 
-2. Save the VPS IP:
-   echo "VPS_IP=<paste-here>" > ${SCRIPT_DIR}/.env
+   This creates a \$6/mo droplet in SFO3 and auto-chains into
+   ./vps-install.sh to install the OMR server.
 
-3. Run the VPS bootstrap (installs OMR server):
-   ./vps-install.sh
+   Alternative: deploy manually via the DO or Vultr web console,
+   then: echo "VPS_IP=<ip>" > ${SCRIPT_DIR}/.env && ./vps-install.sh
 
-4. Flash the Beryl AX:
+2. Flash the Beryl AX:
    • Connect to its default Wi-Fi or LAN port
    • Browse to http://192.168.8.1, complete first-run
    • System → Upgrade → Local Upgrade
@@ -163,7 +157,7 @@ Next steps:
    • ⚠ UNCHECK "Keep settings"
    • Wait 3-5 min for reboot
 
-5. Configure OMR via wizard (see RUNBOOK-BerylAX.md Phase 4 onward):
+3. Configure OMR via wizard (see RUNBOOK-BerylAX.md Phase 4 onward):
    http://192.168.100.1  (root / set a password)
 
 EOF

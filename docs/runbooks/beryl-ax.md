@@ -305,22 +305,52 @@ curl -s ifconfig.me         # MUST return your VPS public IP (not your local ISP
 
 ## Phase 6 — Configure Wi-Fi (~5 min)
 
-The Beryl AX has two radios:
-- **wlan0** = 5GHz (Wi-Fi 6, ~1200 Mbps, shorter range) — use as your **client-facing AP**
-- **wlan1** = 2.4GHz (Wi-Fi 6, ~600 Mbps, longer range) — reserve for **Wi-Fi-as-WAN** later (cruise wifi, hotel wifi, etc.)
+The Beryl AX has two radios. **Field-verified mapping** (the chipset string in LuCI is the ground truth — don't trust intuition; current OMR builds map them like this):
+
+| Radio | Band | LuCI chipset string | Use for |
+|---|---|---|---|
+| **`radio0`** | **2.4 GHz** | `MediaTek MT7981 802.11ax/b/g/n`, Channel 1 (2.412 GHz) | Wi-Fi-as-WAN (cruise/hotel/phone-2 hotspot client) — Phase 9. Also dual-band AP for legacy/long-range clients. |
+| **`radio1`** | **5 GHz** | `MediaTek MT7981 802.11ac/ax/n`, Channel 36 (5.180 GHz) | Primary client-facing AP (faster, no contention with WAN role) |
+
+> **Why this matters:** older OMR docs (and an earlier version of this runbook) had radio0/1
+> swapped. Always verify in LuCI → Network → Wireless: the radio whose chipset string
+> includes `802.11ac` is the 5GHz one (802.11ac is 5GHz-only). The other is 2.4GHz.
 
 LuCI → **Network → Wireless**:
 
-### 6.1 Enable the 5GHz AP for OnePlus
-1. Find the `radio0` (5GHz) section
-2. Click **Edit** on the existing default network
-3. **General Setup**: Mode = Access Point, SSID = `<your-ssid>`, Network = `lan`
-4. **Wireless Security**: Encryption = WPA2-PSK/WPA3-PSK (or just WPA3-PSK if your OnePlus supports it), enter a strong password
-5. Save & Apply
-6. Toggle the radio ON (the **Enable** button on the radio0 row)
+### 6.1 Enable the 5GHz AP (radio1) — primary AP
 
-### 6.2 Leave the 2.4GHz radio off for now
-- We'll turn it on later when you need to capture cruise/hotel wifi (Phase 9, optional)
+1. Find the `radio1` (5GHz) section
+2. Click **Edit** on the existing default SSID
+3. **Device Configuration** tab:
+   - **Operating frequency** → Mode `AX` (or `AC` if you want WiFi 5 only), Channel `36` or `auto`, Width `80 MHz`
+   - **Country Code** → **set explicitly** to your country (e.g. `US - United States`). **Do NOT leave on `driver default`** — that picks regdomain `00` (world), which (a) restricts TX power and channels, and (b) **causes modern phones to silently refuse to associate to 5GHz APs**. This is the single most common "phone won't connect" cause. See `../troubleshooting.md` § "Phone hangs trying to join 5GHz AP".
+4. **Interface Configuration** tab → **General Setup**:
+   - Mode = `Access Point`
+   - ESSID = `<your-ssid>` (e.g. `BerylAX`)
+   - Network = `lan` (binds the AP to your LAN bridge so clients get an IP via DHCP)
+5. **Wireless Security** tab:
+   - Encryption = `WPA2-PSK` (most compatible) or `WPA2-PSK/WPA3-PSK Mixed Mode` if your devices support WPA3.
+   - **Avoid pure WPA3-only on 2.4GHz with AX mode** — known Android handshake hang. See `../troubleshooting.md`.
+   - Key = strong password
+6. Save & Apply
+7. On the Wireless Overview page, click **Enable** on the radio1 row if it isn't already broadcasting.
+
+### 6.2 (Optional) Dual-band: enable 2.4GHz AP (radio0) with the SAME SSID
+
+Use the same SSID + password on radio0 so devices auto-roam between bands (5GHz when close, 2.4GHz when far). Most useful if you have legacy devices or expect to use the Beryl across a large area.
+
+1. Click **Edit** on the radio0 SSID
+2. Device Configuration: Mode `N` (avoid `AX` on 2.4GHz with WPA2 — see the Android hang note in troubleshooting), Channel `auto` or `6`, Width `20 MHz`. Country Code = your country, **not** `driver default`.
+3. Interface Configuration: Mode `Access Point`, ESSID = same name as radio1, Network = `lan`.
+4. Wireless Security: same encryption + same password as radio1.
+5. Save & Apply, then **Enable** radio0.
+
+**Trade-off you're accepting if you enable radio0 as AP now:** you'll need to disable it (or its AP-mode SSID) before you can flip radio0 into Wi-Fi-as-WAN client mode for Phase 9 — same radio can't be AP and Client at the same time. See `../concepts.md` § "Wi-Fi modes — AP vs Client".
+
+### 6.3 Skip 2.4GHz AP if you'll use radio0 for Wi-Fi-as-WAN soon
+
+If you know you're about to add cruise/hotel wifi or a phone-2 hotspot as a third WAN, leave radio0 **disabled for now**. Phase 9 will flip it directly into Client mode to join the upstream wifi. radio1 (5GHz) serves all your client devices.
 
 **CHECKPOINT 5**:
 - Connect OnePlus to the new 5GHz SSID
@@ -366,14 +396,20 @@ tailscale status   # via the app — should show Mac Studio as "active, direct"
 
 Only enable this when you're somewhere with a Wi-Fi-only internet source (cruise wifi, hotel wifi, coffee shop, etc.).
 
-### 9.1 Enable 2.4GHz radio as a client
+### 9.1 Flip `radio0` (2.4GHz) into Client mode
+
 LuCI → **Network → Wireless**:
-1. Find `radio1` (2.4GHz) section → click **Scan**
-2. Select the cruise/hotel SSID → click **Join Network**
-3. Enter password (or leave blank for open wifi)
-4. **Name of the new network**: `wwan` (this becomes a new interface)
-5. **Firewall zone**: `wan`
-6. Save & Apply
+1. If `radio0` is currently running an AP-mode SSID (from Phase 6.2), **disable that SSID first** (Disable button on the SSID row). A radio can't be both AP and Client simultaneously.
+2. On the `radio0` row → click **Scan**.
+3. Select the cruise/hotel/phone-2 SSID → click **Join Network**.
+4. Enter password (or leave blank for open wifi).
+5. **Name of the new network**: `wwan` (this becomes a new logical interface).
+6. **Create / Assign firewall-zone**: `wan`.
+7. Save & Apply.
+
+> The Scan → Join Network flow auto-configures Mode=Client + the right BSSID + encryption type for you. **Don't** manually flip the Mode dropdown to "Client" — the Scan flow is easier and less error-prone. See `../concepts.md` § "Wi-Fi modes — AP vs Client" for the mental model.
+
+> **Most cruise/hotel APs are 2.4GHz only** in the public-access spectrum, which is why we use radio0 here. If the SSID you want to join is 5GHz, swap to radio1 instead — same Scan flow, but it'll cost you your 5GHz AP for client devices.
 
 ### 9.2 Handle the captive portal
 Most cruise/hotel wifi requires browser-based login before they let traffic through. From your laptop on the LAN:

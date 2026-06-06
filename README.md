@@ -45,7 +45,7 @@ KVM-virtualized Debian 12 host with native IPv4 + high-port-friendly firewall wo
 ```
 [Home internet / Starlink] ──ethernet──► Beryl AX eth0 (WAN slot)
 [Phone USB tether]         ──USB-A 3.0──► Beryl AX usb0
-[Phone 2 hotspot]          ──Wi-Fi──────► Beryl AX wwan (radio1, 2.4GHz client)
+[Phone 2 hotspot]          ──Wi-Fi──────► Beryl AX wwan (radio0, 2.4GHz client)
                                               │
                                               ▼
                             [OMR + Glorytun TCP + Shadowsocks-MPTCP]
@@ -56,7 +56,7 @@ KVM-virtualized Debian 12 host with native IPv4 + high-port-friendly firewall wo
                                               ▼
                             [Internet / Tailscale to home Mac Studio]
 
-Beryl AX 5GHz Wi-Fi (radio0) ──► your laptop, phones-as-clients, etc.
+Beryl AX 5GHz Wi-Fi (radio1) ──► your laptop, phones-as-clients, etc.
 ```
 
 See [`docs/why-vps.md`](docs/why-vps.md) for the architectural rationale (why the VPS is
@@ -76,7 +76,8 @@ networking concepts the runbooks assume.
 ├── firmware/                       ← Beryl AX OMR sysupgrade .bin (downloaded by bootstrap)
 └── docs/
     ├── README.md                   ← documentation index + reading-order guide
-    ├── concepts.md                 ← MPTCP scheduler / role / MacVLAN / TCP-vs-UDP / topology
+    ├── concepts.md                 ← MPTCP scheduler / role / MacVLAN / TCP-vs-UDP / topology / Wi-Fi modes
+    ├── testing.md                  ← verification recipes — proof-of-tunnel, throughput, jitter, Tailscale
     ├── troubleshooting.md          ← symptom-indexed failure modes and fixes
     ├── why-vps.md                  ← long-form: why bonding requires a public endpoint
     ├── vps-options.md              ← provider/region comparison
@@ -102,6 +103,9 @@ networking concepts the runbooks assume.
 A few things that bite people on first build (full list in
 [`docs/troubleshooting.md`](docs/troubleshooting.md)):
 
+- ✅ **The one test that proves bonding works:** from a device behind the Beryl,
+  `curl -s ifconfig.me` returns your VPS public IP (not your home ISP IP). See
+  [`docs/testing.md`](docs/testing.md) § "Proof-of-tunnel".
 - ⚠️ **Flashing the Beryl AX**: UNCHECK "Keep settings" or you'll brick the boot.
 - ⚠️ **OMR's default LAN IP** after flashing is `192.168.100.1`, not GL.iNet stock `192.168.8.1`.
 - ⚠️ **First LuCI login**: username `root`, **empty password** — just press Enter.
@@ -111,6 +115,11 @@ A few things that bite people on first build (full list in
   re-trigger the per-VPN-key auto-fetch from the VPS.
 - ⚠️ **Beryl AX port mapping in OMR**: `eth1` = LAN (2.5GbE port), `eth0` = WAN slot (1GbE
   port) — opposite of vanilla OpenWrt.
+- ⚠️ **Beryl AX Wi-Fi country code**: leave it on `driver default` (= regdomain `00`) and
+  modern phones silently refuse to join 5GHz. Set it to your actual country in
+  Network → Wireless → Edit → Device Configuration.
+- ⚠️ **Beryl AX radio mapping**: `radio0` = 2.4GHz, `radio1` = 5GHz (verify via the chipset
+  string in LuCI — `802.11ac` = 5GHz). Earlier doc versions had this backwards.
 - ⚠️ **Building from cruise wifi**: ship wifi often blocks the high ports OMR uses. Build
   from Starlink or cellular, not ship wifi.
 

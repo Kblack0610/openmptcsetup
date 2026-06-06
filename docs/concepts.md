@@ -12,6 +12,7 @@ Topics:
 5. [Interface type](#interface-type) — Normal / MacVLAN / Bridge
 6. [TCP vs UDP and QUIC](#tcp-vs-udp-and-quic) — why MPTCP wraps everything in an outer TCP tunnel
 7. [LAN vs WAN topology](#lan-vs-wan-topology) — behind home router vs replacing it
+8. [Wi-Fi modes — AP vs Client](#wifi-modes-ap-vs-client) — same radio, opposite roles
 
 ---
 
@@ -261,3 +262,55 @@ between LAN devices and the VPS tunnel can saturate the LAN side. If your WAN so
 out under 1GbE (Starlink Mini ~200 Mbps, most home internet < 1Gbps), the 1GbE WAN port is
 fine. If you ever need 2.5GbE on the WAN side, remap `eth0` ↔ `eth1` in `/etc/config/network`
 from a serial console (the swap drops connectivity mid-change).
+
+---
+
+## Wi-Fi modes — AP vs Client {#wifi-modes-ap-vs-client}
+
+A Beryl AX has two radios — `radio0` (2.4GHz) and `radio1` (5GHz) — and each can be in
+one of several modes at a time. The two that matter for this build are **Access Point** and
+**Client**.
+
+| Mode | What the radio does | Who's the AP, who's the client | OMR / OpenWrt zone |
+|---|---|---|---|
+| **Access Point** | Broadcasts a SSID, accepts incoming connections | Beryl is the AP; your laptop/phone are clients | `lan` (clients land on your LAN bridge → get a 192.168.100.x lease → reach internet through the bonded tunnel) |
+| **Client** (a.k.a. STA / "Join Network") | Connects outward to an upstream SSID | Beryl is a client; some other device (cruise wifi AP, phone hotspot) is the AP | `wan` zone (the new `wwan` interface becomes a *source of internet* the Beryl can bond) |
+
+### The critical constraint
+
+A radio is in **one mode at a time**. You can't run radio0 as both "the 2.4GHz AP for my laptop" AND "the 2.4GHz client joining ship wifi" simultaneously. Same physical radio, opposite roles, mutually exclusive.
+
+This is why the build typically reserves the bands by role:
+
+| Radio | Band | Suggested role |
+|---|---|---|
+| `radio0` | 2.4 GHz | **Wi-Fi-as-WAN client** (joins ship wifi / hotel wifi / phone-2 hotspot) — most public/portable APs are 2.4GHz |
+| `radio1` | 5 GHz | **Client-facing AP** (your laptop/phone connect to it) — faster, less contention with the WAN job |
+
+If you want dual-band AP for client devices (5GHz close, 2.4GHz for range), you give up Wi-Fi-as-WAN until you flip radio0 back to Client mode. Pick based on where you are: at home or in a hotel room with ethernet, dual-band AP is fine; on a cruise where ship wifi is your WAN, radio0 belongs in Client mode.
+
+### How to switch modes — use Scan / Join Network, not the Mode dropdown
+
+LuCI's wireless edit dialog has a Mode dropdown that includes `Client`. You can change it there, but you also have to manually enter the upstream BSSID, encryption type, password — all by hand. Easier and less error-prone:
+
+1. Wireless Overview → click **Scan** on the radio you want as a Client
+2. Pick the upstream SSID from the scan results → click **Join Network**
+3. Enter the upstream password, set "Name of the new network" → `wwan`, set firewall zone → `wan`
+4. Submit
+
+That flow auto-configures Mode=Client + BSSID + encryption + creates the `wwan` interface in one shot. Save & Apply on the parent page.
+
+### Why the network zone matters
+
+For AP mode, Network = `lan` is correct: the radio joins the LAN bridge, clients get DHCP from the Beryl, traffic flows out via the bonded WANs.
+
+For Client mode, Network = `wwan` on firewall zone `wan` is correct: the radio is a *source of internet*, not a destination for clients. If you accidentally put a Client-mode interface on the `lan` zone, the firewall blocks it from being a WAN and OMR can't bond it.
+
+### Common confusion: "should my phone connect to the Beryl's wifi for phone-2 hotspot?"
+
+No — direction is reversed. For phone-2-as-WAN:
+- **Phone 2 hosts** a Mobile Hotspot (it's the AP)
+- **Beryl joins** phone 2's hotspot in Client mode on radio0 (it's the client)
+- Beryl then has internet *from* phone 2, which it bonds with its other WANs
+
+You only "connect your phone to the Beryl's wifi" for phones that are clients of your bonded setup (i.e., they receive internet from the Beryl). Phones that *provide* internet to the Beryl are upstream APs, and the Beryl joins them.

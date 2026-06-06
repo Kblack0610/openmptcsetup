@@ -15,6 +15,7 @@ matches what you're trying to do.
 | Understand *why* you need a VPS at all | [`why-vps.md`](why-vps.md) |
 | Compare VPS providers / regions | [`vps-options.md`](vps-options.md) |
 | Understand a setting before you change it (scheduler, role, MacVLAN, etc.) | [`concepts.md`](concepts.md) |
+| Prove the tunnel works / measure throughput / verify Tailscale-direct | [`testing.md`](testing.md) |
 | Diagnose a specific failure / red dashboard card | [`troubleshooting.md`](troubleshooting.md) |
 
 ## Map
@@ -22,7 +23,8 @@ matches what you're trying to do.
 ```
 docs/
 ├── README.md                ← you are here
-├── concepts.md              ← MPTCP scheduler / role / MacVLAN / TCP-vs-UDP / topology
+├── concepts.md              ← MPTCP scheduler / role / MacVLAN / TCP-vs-UDP / topology / Wi-Fi modes
+├── testing.md               ← verification recipes — proof-of-tunnel, throughput, jitter, Tailscale
 ├── troubleshooting.md       ← symptom-indexed failure modes and fixes
 ├── why-vps.md               ← long-form architectural rationale
 ├── vps-options.md           ← provider comparison (DigitalOcean / Vultr / Linode / Hetzner / etc.)
@@ -40,7 +42,8 @@ works well:
 1. [`why-vps.md`](why-vps.md) — what problem this whole setup solves
 2. [`concepts.md`](concepts.md) — the mental models that the runbooks assume
 3. [`runbooks/beryl-ax.md`](runbooks/beryl-ax.md) — actual step-by-step
-4. [`troubleshooting.md`](troubleshooting.md) — keep this open in another tab while building
+4. [`testing.md`](testing.md) — the proof-of-tunnel test (run after each phase to confirm progress)
+5. [`troubleshooting.md`](troubleshooting.md) — keep this open in another tab while building
 
 If you're building under time pressure (hotel before a cruise), skip straight to
 [`runbooks/cruise-checklist.md`](runbooks/cruise-checklist.md). It's self-contained and

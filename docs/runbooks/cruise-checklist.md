@@ -100,9 +100,14 @@ curl -s ifconfig.me   # MUST return your DigitalOcean SFO3 IP
 That IP = proof the bonded tunnel is your egress. **This is the milestone that means it works.**
 
 ## 7. Wi-Fi AP for your devices
-LuCI → **Network → Wireless** → `radio0` (5GHz) → Edit: Mode = Access Point, set SSID + WPA2/WPA3
-password, Network = `lan`. Save & Apply, toggle the radio **ON**. Connect a device, confirm
-`ifconfig.me` shows the SFO3 IP again.
+LuCI → **Network → Wireless** → `radio1` (**5GHz** — the row whose chipset string includes `802.11ac`; radio0 is 2.4GHz) → Edit:
+- **Device Configuration**: Country Code = **`US - United States`** (or your country). **Do NOT leave on `driver default`** — `00` regdomain causes modern phones to silently refuse to associate. This is the #1 "phone won't connect" cause on 5GHz.
+- **Interface Configuration**: Mode = `Access Point`, SSID, Network = `lan`.
+- **Wireless Security**: `WPA2-PSK` (most compatible) or `WPA2-PSK/WPA3-PSK Mixed Mode`. Set a password.
+
+Save & Apply, toggle the radio **ON**. Connect a device, confirm `ifconfig.me` returns the SFO3 IP.
+
+> **Reserve `radio0` (2.4GHz) for Wi-Fi-as-WAN client mode** (Phase B-11). Don't enable it as an AP unless you're sure you won't need it for ship/hotel wifi later — a radio can't be AP and Client simultaneously.
 
 ## 8. (If you use Tailscale) ByPass rules
 LuCI → **OpenMPTCProuter → ByPass**: add UDP 41641, TCP 443, UDP 3478. Lets Tailscale ride
@@ -128,9 +133,9 @@ ssh root@192.168.100.1 reboot
    (S25 stays as a secondary — useful near ports.)
 
 ## 11. Add ship wifi (Wi-Fi-as-WAN)
-LuCI → **Network → Wireless** → `radio1` (2.4GHz) → **Scan** → join the ship SSID → name it
+LuCI → **Network → Wireless** → `radio0` (**2.4GHz** — most cruise/hotel APs broadcast on 2.4 in the open spectrum) → **Scan** → join the ship SSID → name it
 `wwan`, firewall zone `wan`. Clear the captive portal from a laptop (`http://example.com` —
-HTTP, not HTTPS). Add `wwan` to the wizard as a **lower-priority** WAN.
+HTTP, not HTTPS). Add `wwan` to the Settings page as a new WAN block (Type = Normal, Protocol = DHCP, Physical interface = `wwan`, MPTCP = On but **not Master** — keep Starlink/home as Master).
 
 ## 12. Set the MPTCP scheduler for what you're doing
 ```bash
@@ -171,7 +176,10 @@ the single public endpoint is what makes recombination possible. No VPS = no bon
 | Symptom | Fix |
 |---|---|
 | Stuck on GL.iNet after flash | Forgot to uncheck "Keep settings" → U-Boot recovery: hold reset 8s on power-on, `http://192.168.1.1`, reflash |
-| `usb0` missing after S25 tether | `opkg install kmod-usb-net-rndis`, replug |
+| `usb0` missing after S25 tether | RNDIS is **built-in** on current OMR Beryl AX images — don't install. Toggle USB-tethering off+on on the phone; replug; try a different cable. `dmesg \| tail` should show `rndis_host ... usb0: register 'rndis_host'`. |
+| Phone hangs trying to join 5GHz Wi-Fi | Country Code is `00` / `driver default` → modern phones refuse. Set explicitly to `US - United States` (or your country). |
+| Phone joins 2.4GHz Wi-Fi, fails 4-way handshake | `AX` mode + `WPA2-PSK` is fragile on some Android phones. Drop Mode to `N` on 2.4GHz, keep WPA2-PSK. |
+| Phone "saved" the SSID before you changed encryption / password — silent fail | On the phone: tap-and-hold SSID → **Forget network** → re-join with new password. The phone otherwise tries cached (wrong) credentials and stalls. |
 | `ifconfig.me` shows local ISP, not SFO3 IP | Tunnel down — check OMR Status, verify VPS firewall ports open |
 | Tunnel won't establish on ship wifi | DPI blocking VPN → switch to Shadowsocks-only (step 13) |
 | Client on Beryl Wi-Fi can't reach internet | SSID attached to wrong zone → Wireless → edit SSID → Network = `lan` |

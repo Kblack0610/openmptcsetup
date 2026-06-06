@@ -18,6 +18,11 @@ Sections:
 11. [Tailscale collapses to ~5 Mbps over the bonded tunnel](#tailscale-derp-relay)
 12. [Cruise / hotel wifi: tunnel won't establish](#cruise-tunnel-blocked)
 13. [Building VPS from cruise/hotel internet fails on high ports](#building-from-cruise-wifi)
+14. [Phone hangs trying to join 5GHz AP (`radio1`)](#phone-hangs-5ghz)
+15. [Phone hangs trying to join 2.4GHz AP (`radio0`)](#phone-hangs-2ghz)
+16. [Phone refuses an SSID whose password you just changed](#phone-cached-credentials)
+17. [Wireless Overview shows "Encryption: None" but you set WPA2](#encryption-none-after-save)
+18. [Which radio is which? I have `radio0` and `radio1` backwards](#radio-mapping-confused)
 
 ---
 
@@ -395,3 +400,112 @@ install from here.
 
 Don't try to build the VPS over ship wifi unless you've confirmed high ports are open.
 See `runbooks/cruise-checklist.md` § "Can I build this from the cruise internet?"
+
+---
+
+## Phone hangs trying to join 5GHz AP (`radio1`) {#phone-hangs-5ghz}
+
+You've configured the 5GHz radio as an AP, set WPA2-PSK with a password, and your phone scans the SSID, taps it, types the password, and **just hangs on "Connecting…" forever** — or fails without a useful error. The laptop on the same SSID may work fine.
+
+**Cause #1 (overwhelmingly likely on 5GHz): Country Code is `00` / `driver default`.**
+
+Country `00` is the "world / unset" regulatory domain. Modern Android and iOS implementations refuse to associate to 5GHz APs broadcasting country `00` because the phone can't validate that the AP's channel/power is legal in its current location. Symptom is exactly "hangs on Connecting…" — no error, no association complete.
+
+The Status box in LuCI's Edit screen tells you: look for `Country: 00`. That's it.
+
+**Fix:**
+1. Edit the radio1 SSID → **Device Configuration** tab → **Country Code** dropdown
+2. Change from `driver default` to **`US - United States`** (or your actual country)
+3. Save (in dialog), then Save & Apply on the Wireless Overview page
+4. Re-try phone. Association completes within a second or two.
+
+**Verify from SSH:**
+```bash
+ssh root@192.168.100.1
+iw reg get        # should show "country US:" not "country 00:"
+uci get wireless.radio1.country    # should show your country code, not empty
+```
+
+**Cause #2 (much rarer): channel restricted under your country's DFS rules.**
+
+Channel 36 works in nearly every country. Channels 52-144 (DFS) require radar avoidance. If you picked one of those manually and your country forbids it without certified DFS, the radio falls back silently. Stick to **Channel 36 or `auto`** for the AP. (5GHz client mode for Wi-Fi-as-WAN is fine on DFS channels — different rules.)
+
+**Cause #3 (rare, model-specific): some older phones don't do WPA3 on 5GHz cleanly.**
+
+If you used `WPA3-PSK` exclusively and your phone is pre-2020, drop to `WPA2-PSK/WPA3-PSK Mixed Mode` or pure `WPA2-PSK`.
+
+---
+
+## Phone hangs trying to join 2.4GHz AP (`radio0`) {#phone-hangs-2ghz}
+
+Same symptom as above but on 2.4GHz. Country code matters less on 2.4GHz (channels 1-11 are universal), so `00` is less likely to be the immediate culprit. Different cause.
+
+**Cause: AX (Wi-Fi 6) mode + WPA2-PSK on 2.4GHz, with some Android phones.**
+
+Wi-Fi 6 on 2.4GHz is fragile in real-world driver/firmware combinations. The WPA2 handshake during association sometimes hangs because the spec increasingly expects WPA3 for AX-mode APs, and the 4-way handshake gets confused with TKIP/CCMP negotiation. Samsung Galaxy phones (S22 / S23 / S24 generation, certain firmware revisions) and some Pixel firmware are documented to exhibit this.
+
+**Fix:**
+
+1. Edit the radio0 SSID → **Device Configuration** tab → **Operating frequency**
+2. Mode dropdown: change from `AX` → **`N`** (Wi-Fi 4)
+3. Keep Width = `20 MHz`, Channel = `auto` or `6`
+4. Save & Apply
+5. Re-try phone.
+
+If you also need to set the Country Code while you're there (see § Phone hangs trying to join 5GHz), do both at once.
+
+**Why this works:** 802.11n + WPA2-PSK is the most universally tested combination in existence. Any phone made after ~2010 handshakes against it cleanly. You sacrifice some peak throughput (which 2.4GHz can't deliver anyway in a noisy band), and you get reliable connectivity.
+
+If you don't want to lose AX on 2.4GHz, the alternative workaround is pure `WPA3-PSK` (not mixed) on 2.4GHz — but that locks out any device without WPA3 (most pre-2019 phones, many IoT). Drop-to-N is the safer fix.
+
+---
+
+## Phone refuses an SSID whose password / encryption you just changed {#phone-cached-credentials}
+
+You changed the SSID's encryption (e.g., None → WPA2-PSK) or the password. Your phone scans the SSID, taps it, types the new password, and either rejects it ("incorrect password" — even though you typed it right) or hangs forever.
+
+**Cause:** Phone has a cached profile for that SSID with the OLD encryption / password. When you tap the SSID, the OS reuses the cached profile and ignores what you just typed, then silently fails the handshake.
+
+**Fix on the phone:** WiFi settings → tap-and-hold (Android) or tap the (i) (iOS) on the SSID → **Forget network** → re-scan → tap again → enter password fresh.
+
+This is the **#1 cause** of "I just changed the WPA settings and now I can't connect." Always forget + re-add when you've changed encryption on the AP side.
+
+---
+
+## Wireless Overview shows "Encryption: None" but you set WPA2 {#encryption-none-after-save}
+
+You went into the Wireless Security tab, picked WPA2-PSK, set a password, clicked **Save** — but the Wireless Overview still shows the SSID with `Encryption: None`. Phones connect without a password / hang on connect.
+
+**Cause:** LuCI's wireless edit dialog has **two save buttons**:
+- **Save** (inside the Edit modal) — *stages* the change in the candidate config
+- **Save & Apply** (on the parent Wireless Overview page) — *commits and deploys* the candidate config to running config
+
+Hitting only the inner Save dismisses the dialog but never applies the change. The Status box on the dialog itself is cached from when the page loaded, so re-opening the dialog shows your changes (because they're staged), but the live AP still runs the old open config.
+
+**Fix:** after closing the Edit dialog, you should land back on Wireless Overview with a yellow banner saying "Unsaved Changes." Click **Save & Apply** there. Wait 5-10s for hostapd to restart. SSH check:
+
+```bash
+ssh root@192.168.100.1
+uci show wireless | grep -E 'ssid|encryption|key'   # what's in the saved config
+ps | grep hostapd                                    # hostapd process
+logread | grep -iE 'hostapd|wlan' | tail -20         # recent association events
+```
+
+You want to see `encryption='psk2'` (or `'psk-mixed'`) and a `key='...'` line. If you see `encryption='none'`, the Save & Apply never went through.
+
+---
+
+## Which radio is which? I have `radio0` and `radio1` backwards {#radio-mapping-confused}
+
+OpenWrt's `radio0` / `radio1` naming is **not standardized by band** — different drivers and devices assign them differently. The Beryl AX (MediaTek MT7981) current OMR build assigns them like this:
+
+| LuCI label | Band | LuCI chipset string | Notes |
+|---|---|---|---|
+| **`radio0`** | **2.4 GHz** | `MediaTek MT7981 802.11ax/b/g/n`, Channel 1 (2.412 GHz) | Slower, longer range. Use for Wi-Fi-as-WAN client mode. |
+| **`radio1`** | **5 GHz** | `MediaTek MT7981 802.11ac/ax/n`, Channel 36 (5.180 GHz) | Faster, shorter range. Primary client-facing AP. |
+
+**Ground truth check:** the radio whose chipset string includes **`802.11ac`** is always 5GHz (802.11ac is a 5GHz-only spec). The other one is 2.4GHz. Don't trust memorized band/`radioN` pairings — verify from the chipset string in Network → Wireless.
+
+If you see `2.412 GHz` in the Channel field, that's 2.4GHz. If you see `5.180 GHz` (or any `5.xxx`), that's 5GHz.
+
+**Older versions of these docs had `radio0` and `radio1` swapped.** If a runbook step seems backwards relative to LuCI, trust LuCI (the chipset strings) and file an issue against the doc.

@@ -67,6 +67,24 @@ REMOTE_SCRIPT=$(cat <<'REMOTE'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
+# Fresh DO Debian droplets run apt-daily/unattended-upgrades on first boot.
+# Wait for those to release the apt/dpkg locks before our own apt-get runs.
+echo "[VPS] Waiting for cloud-init apt jobs to finish..."
+for i in $(seq 1 60); do
+  if ! pgrep -x apt-get >/dev/null 2>&1 \
+     && ! pgrep -x apt >/dev/null 2>&1 \
+     && ! pgrep -x dpkg >/dev/null 2>&1 \
+     && ! pgrep -x unattended-upgrade >/dev/null 2>&1 \
+     && ! fuser /var/lib/apt/lists/lock /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock >/dev/null 2>&1; then
+    echo "[VPS] apt locks clear (waited ~$((i*5))s)"
+    break
+  fi
+  sleep 5
+  if [ "$i" = "60" ]; then
+    echo "[VPS] WARNING: apt still busy after 5 minutes; proceeding anyway"
+  fi
+done
+
 echo "[VPS] Updating base packages..."
 apt-get update -qq
 apt-get -y -qq upgrade
@@ -76,7 +94,11 @@ echo "[VPS] Running OMR server installer..."
 wget -qO - https://www.openmptcprouter.com/server/debian-x86_64.sh \
   | IPERF="no" OPENVPN="no" KERNEL="6.12" sh
 
-echo "[VPS] OMR install complete — system will reboot."
+echo "[VPS] OMR install complete — triggering reboot to activate MPTCP + shorewall + sshd@65222"
+touch /root/.omr-install-done
+# OMR's installer no longer reboots itself; trigger it in the background so this
+# SSH command can exit cleanly before the box drops.
+nohup bash -c 'sleep 3 && systemctl reboot' >/dev/null 2>&1 &
 REMOTE
 )
 

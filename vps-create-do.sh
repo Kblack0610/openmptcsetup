@@ -60,7 +60,7 @@ LOCAL_FINGERPRINT=$(ssh-keygen -lf "${SSH_KEY}.pub" | awk '{print $2}' | sed 's/
 MD5_FP=$(ssh-keygen -E md5 -lf "${SSH_KEY}.pub" | awk '{print $2}' | sed 's/^MD5://')
 
 EXISTING_KEY_ID=$(doctl compute ssh-key list --format ID,FingerPrint --no-header 2>/dev/null \
-  | grep -F "${MD5_FP}" | awk '{print $1}' | head -1)
+  | grep -F "${MD5_FP}" | awk '{print $1}' | head -1 || true)
 
 if [[ -n "${EXISTING_KEY_ID}" ]]; then
   ok "Key already registered in DO (ID: ${EXISTING_KEY_ID})"

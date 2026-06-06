@@ -8,7 +8,7 @@ Hardware:
 - GL.iNet GL-MT3000 (Beryl AX) — runs OMR directly, broadcasts Wi-Fi to clients
 - Samsung Galaxy S25 — USB tether for T-Mobile 5G
 - Starlink Mini — primary WAN via ethernet
-- Vultr LAX VPS — bonding endpoint
+- DigitalOcean SFO3 VPS — bonding endpoint (provisioned by `vps-create-do.sh`)
 
 R6S goes back in the box for now. You can swap to the R6S runbook (`RUNBOOK-R6S.md`) if you ever outgrow 2 WANs or need 1 Gbps+ encrypted bonded throughput.
 
@@ -18,67 +18,51 @@ R6S goes back in the box for now. You can swap to the R6S runbook (`RUNBOOK-R6S.
 
 ```bash
 cd ~/dev/openmptcsetup
-mkdir -p firmware
-
-# Tools you'll need (probably already have these)
-which curl wget sha256sum 2>/dev/null
-
-# SSH keypair for the VPS (skip if reusing one)
-ssh-keygen -t ed25519 -f ~/.ssh/omr_vps -C "omr-vps"
+./bootstrap.sh
 ```
+
+`bootstrap.sh` checks for required tools, generates the `~/.ssh/omr_vps` keypair (if missing),
+and downloads + checksum-verifies the official Beryl AX firmware into `./firmware/`. This covers
+Phase 2 as well — once it's done, the image is already staged and verified.
 
 ---
 
-## Phase 1 — Vultr LAX VPS (~10 min)
+## Phase 1 — DigitalOcean SFO3 VPS (~10 min)
 
-Identical to the R6S runbook. If you've already done this, skip to Phase 2.
+**Scripted path (recommended).** From your CachyOS box (uses your existing `doctl` auth):
 
-### 1.1 Provision
+```bash
+cd ~/dev/openmptcsetup
+./vps-create-do.sh
+```
 
-1. https://my.vultr.com → Deploy New Server
-2. **Cloud Compute - Shared CPU** (cheapest tier)
-3. **Location**: Los Angeles
-4. **OS**: Debian 12 x64
-5. **Plan**: $6/mo (1 vCPU, 1 GB RAM, 25 GB SSD, 1 TB bandwidth)
-6. **Additional features**: enable IPv6, disable auto-backups
-7. **SSH Keys**: upload `~/.ssh/omr_vps.pub`
-8. **Hostname**: `omr-lax`
-9. Deploy. Wait ~60s. Note the public IPv4.
+This creates a $6/mo Debian 12 droplet in **SFO3**, then auto-chains into `vps-install.sh`,
+which upgrades the base system, runs the OMR server installer (MPTCP kernel 6.12 + Glorytun +
+Shadowsocks-libev + MLVPN + DSVPN, with the Debian 12 install-bug workaround), opens the firewall
+(Phase 1.3 below — done for you), reboots, and moves SSH to port **65222**. When it finishes it
+writes your **Server IP + User Key** to `vps-credentials.txt` — that's what you paste into the
+Beryl AX wizard in Phase 5.
+
+> **Region note:** SFO3 is correct even for the Alaska cruise. The VPS should sit near your
+> *destinations* (SoCal home/corp), not near your physical location; on a cruise the satellite
+> uplink latency dominates anyway, and DO's only US-West region is SFO. See `VPS-options.md`.
+
+> **Building from the ship?** Fine over **Starlink** (high ports open, no DPI). Avoid building
+> over **ship wifi** — it often blocks the high SSH/tunnel ports. See `CRUISE-CHECKLIST.md`.
+
+### Manual fallback (no doctl, or using Vultr/another provider)
+
+1. Deploy a **Debian 12 x64**, KVM, 1 vCPU / 1 GB instance with native public IPv4 + IPv6,
+   upload `~/.ssh/omr_vps.pub`. (Vultr LAX or DO SFO3 both work — see `VPS-options.md`.)
+2. Point the installer at it and let it do the rest:
 
 ```bash
 echo "VPS_IP=<paste-here>" > ~/dev/openmptcsetup/.env
+./vps-install.sh    # runs the OMR installer + firewall + saves vps-credentials.txt
 ```
 
-### 1.2 Install OMR server
-
-```bash
-ssh -i ~/.ssh/omr_vps root@<VPS_IP>
-
-# Inside the VPS:
-apt update && apt -y upgrade
-reboot
-```
-
-Wait 30s, SSH back in:
-
-```bash
-ssh -i ~/.ssh/omr_vps root@<VPS_IP>
-
-# Install OMR server (with the Debian 12 install-bug workaround)
-wget -O - https://www.openmptcprouter.com/server/debian-x86_64.sh | \
-  IPERF="no" OPENVPN="no" KERNEL="6.12" sh
-```
-
-The script will install MPTCP kernel 6.12 + Glorytun + Shadowsocks-libev + MLVPN + DSVPN, generate keys at `/root/openmptcprouter_config.txt`, move SSH to port **65222**, then reboot. You'll get kicked out — normal.
-
-Wait ~90s, SSH back in on the new port:
-
-```bash
-ssh -i ~/.ssh/omr_vps -p 65222 root@<VPS_IP>
-
-cat /root/openmptcprouter_config.txt
-# Copy "Server IP" and "User key" — paste into the Beryl AX wizard later
-```
+The OMR installer moves SSH to port **65222** and reboots — `vps-install.sh` handles the
+reconnect and credential extraction automatically.
 
 ### 1.3 Open firewall
 
@@ -104,6 +88,10 @@ All three must respond.
 ---
 
 ## Phase 2 — Download the official OMR Beryl AX image (~5 min)
+
+> **Already done if you ran `./bootstrap.sh` in Pre-flight** — it discovers the latest release,
+> downloads the `glinet_gl-mt3000-squashfs-sysupgrade.bin`, and verifies its checksum into
+> `./firmware/`. The manual steps below are a fallback / reference.
 
 ```bash
 cd ~/dev/openmptcsetup/firmware

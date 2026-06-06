@@ -78,6 +78,7 @@ networking concepts the runbooks assume.
     ├── README.md                   ← documentation index + reading-order guide
     ├── concepts.md                 ← MPTCP scheduler / role / MacVLAN / TCP-vs-UDP / topology / Wi-Fi modes
     ├── testing.md                  ← verification recipes — proof-of-tunnel, throughput, jitter, Tailscale
+    ├── playbook.md                 ← command cheatsheet for live monitoring + debugging
     ├── troubleshooting.md          ← symptom-indexed failure modes and fixes
     ├── why-vps.md                  ← long-form: why bonding requires a public endpoint
     ├── vps-options.md              ← provider/region comparison
@@ -106,6 +107,9 @@ A few things that bite people on first build (full list in
 - ✅ **The one test that proves bonding works:** from a device behind the Beryl,
   `curl -s ifconfig.me` returns your VPS public IP (not your home ISP IP). See
   [`docs/testing.md`](docs/testing.md) § "Proof-of-tunnel".
+- 🔍 **Live monitoring commands** when you want to see what's actually happening:
+  [`docs/playbook.md`](docs/playbook.md) — interface state, MPTCP subflows, scheduler,
+  service health, the lot.
 - ⚠️ **Flashing the Beryl AX**: UNCHECK "Keep settings" or you'll brick the boot.
 - ⚠️ **OMR's default LAN IP** after flashing is `192.168.100.1`, not GL.iNet stock `192.168.8.1`.
 - ⚠️ **First LuCI login**: username `root`, **empty password** — just press Enter.

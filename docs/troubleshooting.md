@@ -23,6 +23,7 @@ Sections:
 16. [Phone refuses an SSID whose password you just changed](#phone-cached-credentials)
 17. [Wireless Overview shows "Encryption: None" but you set WPA2](#encryption-none-after-save)
 18. [Which radio is which? I have `radio0` and `radio1` backwards](#radio-mapping-confused)
+19. [Phone associates to Wi-Fi but never gets an IP (then drops)](#wifi-no-dhcp-no-bridge)
 
 ---
 
@@ -509,3 +510,106 @@ OpenWrt's `radio0` / `radio1` naming is **not standardized by band** — differe
 If you see `2.412 GHz` in the Channel field, that's 2.4GHz. If you see `5.180 GHz` (or any `5.xxx`), that's 5GHz.
 
 **Older versions of these docs had `radio0` and `radio1` swapped.** If a runbook step seems backwards relative to LuCI, trust LuCI (the chipset strings) and file an issue against the doc.
+
+---
+
+## Phone associates to Wi-Fi but never gets an IP, then drops {#wifi-no-dhcp-no-bridge}
+
+The Wireless Overview "Associated Stations" list shows only `Access Point "<SSID>" (phy1-ap0)` and no actual clients, even though your phone visibly tries to connect. The phone says "Connected, no internet" for a few seconds, then drops to "Couldn't connect."
+
+This is a **separate failure mode from "Phone hangs trying to join 5GHz AP"** above. There, the phone never associates. Here, association *succeeds*, the WPA handshake completes, and the failure is at the DHCP step.
+
+**Diagnose — tail the AP log on the router while your phone tries:**
+
+```bash
+ssh root@192.168.100.1
+logread -f | grep -E 'hostapd|wpa|dnsmasq|dhcp'
+```
+
+The smoking-gun pattern:
+
+```
+hostapd: phy1-ap0: STA <mac> IEEE 802.11: authenticated
+hostapd: phy1-ap0: STA <mac> IEEE 802.11: associated (aid 1)
+hostapd: phy1-ap0: AP-STA-CONNECTED <mac> auth_alg=open
+hostapd: phy1-ap0: STA <mac> WPA: pairwise key handshake completed (RSN)
+hostapd: phy1-ap0: EAPOL-4WAY-HS-COMPLETED <mac>     ← WPA fine, password fine
+                                                       ← ~18 sec of silence
+hostapd: phy1-ap0: AP-STA-DISCONNECTED <mac>          ← client times out
+```
+
+No `dnsmasq` / `DHCPDISCOVER` / `DHCPOFFER` / `DHCPACK` lines anywhere between connect and disconnect. The ~18-second gap is the phone's "I'm associated but never got an IP" timeout.
+
+**Cause: LAN is not a bridge.** The `lan` interface is configured against a raw ethernet device (e.g., `eth1`) instead of a bridge that includes both ethernet *and* the AP radio. The wireless interface (`phy1-ap0`) has nowhere to plug in at L2, so DHCP frames from the client never reach dnsmasq.
+
+This is the **default state on the GL.iNet Beryl AX (gl-mt3000) shipped OMR image** — `lan` is created as raw `eth1`, not as a bridge. Wired LAN works; Wi-Fi clients silently fail at DHCP.
+
+**Confirm the diagnosis:**
+
+```bash
+# br-lan should exist if the LAN is a bridge. If this errors, lan isn't bridged.
+ip -br link show master br-lan
+# Error: argument "br-lan" is wrong: Device does not exist
+
+uci show network.lan
+# Look at the device= line:
+#   network.lan.device='eth1'    ← BROKEN — raw port, no bridge
+#   network.lan.device='br-lan'  ← CORRECT — bridge with eth1 + wifi as members
+```
+
+Also useful to confirm dnsmasq IS running and listening (rules out other DHCP failures):
+
+```bash
+ps w | grep dnsmasq | grep -v grep              # should show dnsmasq process
+netstat -lnup 2>/dev/null | grep ':67 '         # should show 0.0.0.0:67 → dnsmasq
+```
+
+If both of those are healthy AND `br-lan` doesn't exist, it's definitely the bridge issue.
+
+**Fix via LuCI:**
+
+1. **Network → Interfaces → Devices tab → Add device configuration…**
+   - Device type: `Bridge device`
+   - Device name: `br-lan`
+   - Bridge ports: `eth1` (select from the dropdown — this is the LAN port on Beryl AX; see lessons file)
+   - Save
+2. **Interfaces tab → Edit on `lan` row → General Settings → Device dropdown** → change from `eth1` to `br-lan` ("Bridge device: br-lan"). Save.
+3. **Save & Apply** on the Interfaces page.
+
+LuCI will warn about losing connectivity for ~10 seconds. That's fine — the IP (`192.168.100.1`) moves from `eth1` to `br-lan`, same address, browser reconnects.
+
+**Fix via SSH (faster if you're already on the CLI):**
+
+```bash
+ssh root@192.168.100.1
+
+# Define a br-lan bridge with eth1 as a member
+uci set network.lan_dev=device
+uci set network.lan_dev.name='br-lan'
+uci set network.lan_dev.type='bridge'
+uci add_list network.lan_dev.ports='eth1'
+
+# Point lan at the bridge instead of raw eth1
+uci set network.lan.device='br-lan'
+uci delete network.lan.ifname    # legacy key, conflicts if left in place
+
+uci commit network
+/etc/init.d/network restart      # SSH drops for ~5-10 sec; reconnect at same IP
+sleep 3
+wifi reload                      # ensures hostapd re-attaches phy1-ap0 to br-lan
+```
+
+**Verify the fix worked:**
+
+```bash
+ip -br link show master br-lan
+# Expect both: eth1 and phy1-ap0 listed as members
+
+# Try connecting from your phone, then:
+logread -f | grep -iE 'dnsmasq|dhcp'
+# Expect to see: DHCPDISCOVER → DHCPOFFER → DHCPREQUEST → DHCPACK in sequence.
+```
+
+In Wireless Overview's Associated Stations, your phone's actual MAC should now appear as a real client (not just the AP's `phy1-ap0` entry).
+
+**Why does OMR ship like this?** Most OpenWrt images ship `lan` as a bridge even when it has only one port, precisely so Wi-Fi can be added later without thinking about it. The Beryl AX OMR build for the `gl-mt3000` target ships `lan` as raw `eth1` — works fine until you enable the AP, then you hit exactly this. It's a build quirk, not user error.

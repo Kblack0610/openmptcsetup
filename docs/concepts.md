@@ -13,6 +13,8 @@ Topics:
 6. [TCP vs UDP and QUIC](#tcp-vs-udp-and-quic) — why MPTCP wraps everything in an outer TCP tunnel
 7. [LAN vs WAN topology](#lan-vs-wan-topology) — behind home router vs replacing it
 8. [Wi-Fi modes — AP vs Client](#wifi-modes-ap-vs-client) — same radio, opposite roles
+9. [Bridges and `br-lan`](#bridges-and-br-lan) — why LAN needs to be a virtual switch
+10. [OMR's internal interfaces](#omr-internal-interfaces) — what `omrvpn` and `omr6in4` actually are
 
 ---
 
@@ -314,3 +316,109 @@ No — direction is reversed. For phone-2-as-WAN:
 - Beryl then has internet *from* phone 2, which it bonds with its other WANs
 
 You only "connect your phone to the Beryl's wifi" for phones that are clients of your bonded setup (i.e., they receive internet from the Beryl). Phones that *provide* internet to the Beryl are upstream APs, and the Beryl joins them.
+
+---
+
+## Bridges and `br-lan` {#bridges-and-br-lan}
+
+A **bridge** in Linux networking is a virtual L2 switch implemented in the kernel. You give it a name (`br-lan`) and add *member ports* — physical interfaces (`eth1`), Wi-Fi interfaces (`phy1-ap0`), VLAN sub-interfaces — and the kernel forwards frames between all members as if they were ports on a real Ethernet switch.
+
+The bridge itself becomes an interface you can assign an IP to. Anything on any member port reaches that IP. Anything *behind* that IP (the DHCP server, the firewall rules) sees traffic from all members as if it arrived on one logical LAN.
+
+### Why Wi-Fi specifically needs this
+
+When you create an Access Point in OpenWrt, the kernel materializes a virtual interface called `phy1-ap0` (or `wlan0`, depending on the driver). `hostapd` runs on it and handles WPA authentication. But `phy1-ap0` has no IP, no DHCP server, no firewall policy of its own — it's just a frame source/sink at L2.
+
+For a Wi-Fi client to:
+- Get an IP via DHCP
+- Reach the router's gateway
+- Cross into the WAN side
+
+…something has to wire `phy1-ap0` to the same L2 segment as the LAN. The standard mechanism is a bridge:
+
+```
+  br-lan  (192.168.100.1, dnsmasq listens here, firewall zone "lan")
+   ├── eth1        (wired LAN port — laptops, switches, etc.)
+   └── phy1-ap0    (Wi-Fi AP — phones, wireless laptops)
+```
+
+Now a DHCP request from a Wi-Fi client arrives on `phy1-ap0`, bridges to `br-lan`, hits dnsmasq, gets answered, and returns the same way. The client and a wired laptop are indistinguishable from the firewall's perspective — both on the LAN.
+
+### What goes wrong without a bridge
+
+If `lan` is configured against a raw port (`network.lan.device='eth1'` rather than `'br-lan'`), the IP and dnsmasq live on `eth1` only. Wired clients work. But `phy1-ap0` has no path to anything — it's an orphaned L2 interface. WPA handshake completes because `hostapd` runs locally on the radio and only needs the password to match. DHCP fails because the frames never reach dnsmasq.
+
+The symptom: phone associates, holds for ~18 seconds, drops with "couldn't connect." See `troubleshooting.md` § "Phone associates to Wi-Fi but never gets an IP."
+
+### Why most OpenWrt builds ship `lan` as a bridge by default
+
+Single-port "switches" exist as bridges in stock OpenWrt precisely so that adding Wi-Fi later is a no-op — `option network 'lan'` on the wireless config plugs `phy1-ap0` into the existing bridge automatically. The Beryl AX (gl-mt3000) OMR build is a notable exception: it ships `lan` as raw `eth1`, and you have to convert it manually the first time you enable Wi-Fi.
+
+---
+
+## OMR's internal interfaces — `omrvpn` and `omr6in4` {#omr-internal-interfaces}
+
+When you first look at LuCI's Network → Interfaces page on a fresh OMR install, you see two interfaces that don't correspond to any physical hardware: `omrvpn` and `omr6in4`. Both are tunnels from the router to the VPS. They are the substrate that the entire bonded setup runs on.
+
+### `omrvpn` — the aggregation tunnel
+
+This is **the main MPTCP tunnel from your router to the VPS** — the single logical pipe that all LAN traffic gets shoved into. It's typically a `tun0` device with a DHCP-assigned address pulled from the VPS side.
+
+What's actually happening underneath:
+
+```
+[LAN client] → br-lan → omrvpn (tun0) ← single logical tunnel from client's POV
+                          │
+                          ↓
+              ┌───────────┴───────────┐
+            wan1 (eth0)            wan2 (usb0)    ← physical WANs
+              ↓                       ↓
+             ISP A                   ISP B         ← different egress paths
+              └───────────┬───────────┘
+                          ↓
+                         VPS  → real internet
+```
+
+`omrvpn` is what your client devices think they're using. The Beryl multiplexes traffic across `wan1` + `wan2` underneath using MPTCP (or `glorytun`, `mlvpn`, `dsvpn` depending on which protocol you picked for the primary tunnel). The VPS reassembles and forwards to the actual destination.
+
+If `omrvpn` shows green and is pulling DHCP packets (any non-zero RX/TX), the bonded tunnel is up. If it's red or "Network device is not present," the VPN didn't start — usually a key issue (see `troubleshooting.md` § "VPN not running — empty key").
+
+This is the interface to think about when you ask "is my bonded internet working?" — not the individual WANs. The WANs being green just means they have a path to the VPS; `omrvpn` being green means they're successfully aggregated.
+
+### `omr6in4` — IPv6 over the IPv4 tunnel
+
+This is an **IPv6-in-IPv4 tunnel** (RFC 4213), used to give LAN clients real IPv6 connectivity by wrapping IPv6 packets inside IPv4 ones and sending them to the VPS, which decapsulates and forwards them onto the v6 internet.
+
+Why it exists: your home ISP and your cellular carrier may not hand you native IPv6, but the VPS does. Tunneling lets LAN devices get a v6 prefix delegated from the VPS even when the underlying WANs are v4-only.
+
+In a fresh install, `omr6in4` is usually idle ("Not started on boot", 0 packets) because:
+- The default OMR setup doesn't enable v6 on the VPS unless you opted in during install
+- Most apps work fine over v4 alone
+
+Leave it as-is unless you specifically need IPv6 on the LAN. It doesn't block anything and consumes no resources while inactive.
+
+### Putting it together: the full stack
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│ Wi-Fi client (your phone, laptop, etc.)                       │
+│        ↓                                                       │
+│ phy1-ap0  ─┐                                                   │
+│            ├─→ br-lan (192.168.100.0/24, DHCP, firewall "lan") │
+│ eth1     ──┘                                                   │
+│        ↓                                                       │
+│ omrvpn / tun0  (single logical tunnel, looks like a normal WAN)│
+│        ↓                                                       │
+│   ┌────┴────┐                                                  │
+│ wan1     wan2     ← real WANs (eth0, usb0, wwan, etc.)         │
+│   ↓        ↓                                                   │
+│  ISP A   ISP B                                                 │
+│   └────┬────┘                                                  │
+│        ↓                                                       │
+│       VPS  (reassembly, NAT, real public IP)                   │
+│        ↓                                                       │
+│   The actual internet                                          │
+└───────────────────────────────────────────────────────────────┘
+```
+
+Bottom-up debugging tip: when something's broken, isolate the layer. WANs red? Physical/uplink problem. WANs green but `omrvpn` red? Tunnel/key problem. `omrvpn` green but LAN clients have no internet? Bridge/DHCP problem (the topic of this session's debugging trail).

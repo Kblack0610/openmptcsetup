@@ -15,6 +15,14 @@ Topics:
 8. [Wi-Fi modes — AP vs Client](#wifi-modes-ap-vs-client) — same radio, opposite roles
 9. [Bridges and `br-lan`](#bridges-and-br-lan) — why LAN needs to be a virtual switch
 10. [OMR's internal interfaces](#omr-internal-interfaces) — what `omrvpn` and `omr6in4` actually are
+11. [WAN sources — counting paths and trading them off](#wan-sources-counting-and-tradeoffs) — how many WANs the Beryl AX can do and what each costs
+12. [Ethernet tethering as a WAN source](#ethernet-tether-as-wan) — swapping a phone in for the home cable
+13. [WAN slot configuration — every field explained](#wan-slot-fields) — the OMR Settings page field-by-field
+14. [Wi-Fi-as-WAN deep dive](#wifi-as-wan-deep-dive) — Scan + Join, mode/channel, travelmate auto-switching
+15. [Multiple WANs to the same upstream](#multiple-wans-same-upstream) — `eth0 + wwan_home`, redundancy vs throughput
+16. [SQM with cellular WANs — when to bother](#sqm-with-cellular-wans) — and why mostly not
+17. [Verifying all WANs are actively bonded](#verifying-bonded-wans) — dashboard, SSH, MPTCP introspection
+18. [Device fleet for a mobile bonded build](#device-fleet) — how many phones, SIMs, cables, batteries to carry
 
 ---
 
@@ -422,3 +430,496 @@ Leave it as-is unless you specifically need IPv6 on the LAN. It doesn't block an
 ```
 
 Bottom-up debugging tip: when something's broken, isolate the layer. WANs red? Physical/uplink problem. WANs green but `omrvpn` red? Tunnel/key problem. `omrvpn` green but LAN clients have no internet? Bridge/DHCP problem (the topic of this session's debugging trail).
+
+---
+
+## WAN sources — counting paths and trading them off {#wan-sources-counting-and-tradeoffs}
+
+A common question once the bonded setup is working: "how many WANs can I actually have?" The answer is a tradeoff matrix, not a single number. The Beryl AX has five physical/logical slots that *could* be WAN sources, but every slot you flip from its default role costs you something else.
+
+| Physical | Default role in OMR | Can become a WAN as… | Cost of repurposing |
+|---|---|---|---|
+| `eth0` (1GbE port, labeled WAN on the chassis) | WAN | Home internet, Ethernet-tethered phone, second router uplink — anything that speaks DHCP | None on its own — already a WAN slot |
+| `eth1` (2.5GbE port, labeled LAN on the chassis) | LAN bridge member | A second Ethernet WAN | **You lose wired LAN.** Wi-Fi-only for clients; nothing wired plugs in. |
+| `usb0` (USB-A 3.0 port) | unused unless tether configured | USB-tethered phone, USB-Ethernet adapter, powered hub with multiple adapters | None directly; powered hub adds cost/bulk if going multi |
+| `radio0` (2.4 GHz Wi-Fi) | usually disabled or AP | Wi-Fi-as-WAN client (joins phone hotspot, hotel/ship wifi) | Can't also be the 2.4GHz AP — pick one |
+| `radio1` (5 GHz Wi-Fi) | client-facing AP | Wi-Fi-as-WAN client | **You lose 5GHz AP for your client devices** — they'd fall back to 2.4 or no AP |
+
+**Theoretical maximum:** five WANs simultaneously. **Practical maximum:** three to four. After that, two ceilings start to dominate:
+
+- **Beryl CPU.** The MT7981 dual-core ARM tops out around 600-800 Mbps of aggregate bonded throughput across tunnel encryption + MPTCP scheduling + firewall. Adding a fourth or fifth path past that ceiling adds latency, not bandwidth.
+- **VPS CPU.** Glorytun and Shadowsocks both encrypt every packet. On a 1-vCPU $6 droplet you'll saturate around the same range. The VPS becomes the bottleneck before the Beryl does on a faster home connection.
+
+**Recommended priority order for a travel / cruise / nomad build:**
+
+1. **`eth0` — fastest available wired uplink** (home Ethernet at home; phone Ethernet tether on the road)
+2. **`usb0` — USB-tethered phone** (most stable cellular path, no Wi-Fi airtime tax)
+3. **`wwan` via `radio0` — Wi-Fi-as-WAN** (phone hotspot or hotel/ship wifi when available)
+4. *(optional 4th)* **`eth1` — second Ethernet tether** (only if you've consciously decided to drop wired LAN)
+
+Three carriers + Starlink covers nearly every realistic scenario without hitting the diminishing-return wall.
+
+### Carrier diversity matters more than path count
+
+When the goal is *resilience while traveling*, the math is:
+
+- Three plans on three **different carriers** (Verizon, T-Mobile, AT&T) → one of the three works almost everywhere with cellular coverage
+- Three plans on the **same carrier or MVNOs that ride the same upstream** → all fail together in a carrier outage or coverage gap
+
+US MVNO upstream map (as of 2026 — verify, this shifts): Mint → T-Mobile, US Mobile Warp 5G → Verizon, US Mobile GSM → T-Mobile, Cricket → AT&T, Visible → Verizon, Google Fi → primarily T-Mobile. Two plans on the "same underlying carrier" buy you no resilience.
+
+### Why I'd stop at 3 even with the hardware budget
+
+- The Beryl AX's bonding ceiling is ~600-800 Mbps total — three modest WANs already saturate the router CPU on the encryption path.
+- Each path past saturation adds failure modes to debug rather than throughput.
+- Each cellular WAN burns one phone's data plan. Aggressive aggregation is expensive — keep some plans as cold spares rather than hot bonded paths.
+- Three paths give clean redundancy (any one can die, the remaining two cover) without the complexity tax of larger fan-out.
+
+---
+
+## Ethernet tethering as a WAN source {#ethernet-tether-as-wan}
+
+Once `wan1` is configured against `eth0` with Type **Normal** and Protocol **DHCP client**, the port is *physical-agnostic*: it doesn't care what device is on the other end of the cable, as long as that device hands out a DHCP lease. This is what makes Ethernet tethering work as a drop-in swap for home internet.
+
+### The seamless-swap workflow
+
+The procedure for replacing your home Ethernet with a phone Ethernet tether is just:
+
+1. Unplug the home ISP cable from the Beryl's WAN port (`eth0`)
+2. Plug in a USB-C-to-Ethernet adapter that's connected to your phone
+3. Enable Ethernet tethering on the phone (see per-phone toggle paths below)
+4. Wait ~5-10 sec for `wan1` to re-DHCP
+
+**No OMR config changes required.** No re-running any wizard. No `wifi reload`. The OMR Settings page's `wan1` block stays as-is. Mentally renaming "wan1 = home" to "wan1 = whatever's plugged into eth0" is the framing that makes this make sense.
+
+### What changes under the hood
+
+| Layer | Before swap (home cable) | After swap (phone tether) | Who handles it |
+|---|---|---|---|
+| Upstream MAC | home router's MAC | phone's RNDIS MAC | netifd / ARP — automatic |
+| `eth0` IP | home subnet (e.g., 192.168.1.115) | phone's RNDIS subnet (e.g., 192.168.42.x) | udhcpc on the Beryl — automatic |
+| Public IP (egress) | home ISP's public IP | carrier's CGNAT/public range | n/a — both still tunnel to your VPS, so destinations only see the VPS IP either way |
+| MTU | usually 1500 | usually 1428-1500 depending on carrier | MPTCP path MTU discovery — automatic, may stutter briefly |
+| MPTCP subflow | one subflow over old path | old subflow dropped, new subflow opened | omr-tracker + kernel MPTCP — ~10 sec |
+| Active TCP connections | running | continue on surviving subflows (`usb0`, `wwan`) during the swap | MPTCP — that's the point |
+
+If your bond has at least one other active WAN (e.g., `usb0` from a different tether or `wwan` from a Wi-Fi-as-WAN), live sessions (SSH, Zoom, VDI, streaming) **survive the cable swap** because MPTCP keeps the connections alive on the other paths while `eth0`'s subflow reconverges.
+
+### Per-phone Ethernet-tethering toggle paths
+
+| Phone OS | Path | Persistence behavior |
+|---|---|---|
+| **Samsung (OneUI 6+)** | Settings → Connections → Mobile Hotspot and Tethering → **Ethernet tethering** | Greyed out until USB-Ethernet adapter is connected. Re-enable per session. |
+| **OnePlus (OxygenOS 14/15)** | Settings → Wi-Fi & network → Personal Hotspot → **Ethernet tethering** (some builds bury or omit this) | Per-session. Use USB tethering with USB-Ethernet adapter as fallback. |
+| **Pixel (Android 14+)** | Settings → Network & internet → Hotspot & tethering → **Ethernet tethering** | Per-session. |
+| **iPhone** | Not supported. Apple does not expose Ethernet tethering. | Use USB or Wi-Fi tether instead. |
+
+### Gotchas worth knowing
+
+- **Carrier tether detection.** Some US carriers (Verizon and AT&T on lower-tier plans) detect tethering via deep packet inspection — TTL fingerprinting, user-agent matching, traffic-pattern analysis — and throttle tethered traffic to ~600 Kbps or block it outright. T-Mobile and most MVNOs are more permissive. Test each plan in tether before relying on it for the bond.
+- **Battery + heat.** Ethernet tethering keeps the cellular radio busy and the USB peripheral powered — phone burns through battery and gets warm. Plug the phone into a charger separately during long sessions.
+- **Adapter quality matters.** Cheap unbranded USB-C-to-Ethernet adapters drop link under sustained throughput. Stick with Anker / UGREEN / CalDigit. Verify with `dmesg` after plugging in — you want to see a clean `cdc_ether` or `r8152` driver attach, no resets.
+- **Phone-side hotspot timeout.** Some Android builds disable hotspot/tether after N minutes of "no client traffic." If the Beryl is mid-rebound and not actively pulling DHCP, the phone may pre-emptively disable tethering. Solution: have the phone's hotspot/tether config set to "never auto-disable" if the option exists.
+
+### When Ethernet tether beats USB tether or Wi-Fi tether
+
+Use **Ethernet tether** when:
+- You want the most stable wired link with the lowest jitter (Ethernet's 1500-byte MTU, no airtime contention)
+- The phone's hotspot Wi-Fi shares spectrum with your client AP and you're seeing interference
+- The Beryl's USB-A port is already occupied by another tether
+
+Use **USB tether** when:
+- You don't have a USB-C-to-Ethernet adapter handy
+- The phone doesn't expose Ethernet tethering (OnePlus on some builds, all iPhones)
+- You're powering the phone off the Beryl's USB-A simultaneously (USB-A can do both data + 500mA charging)
+
+Use **Wi-Fi-as-WAN** when:
+- You want no cables at all (cruise cabin, hotel room with phone in pocket)
+- You're joining someone else's hotspot you can't physically connect to (ship wifi, conference wifi)
+- You're accepting more jitter and shared-spectrum overhead for the convenience
+
+A practical multi-WAN build often uses all three styles — Ethernet for the strongest carrier on the strongest plan, USB for a second carrier, Wi-Fi-as-WAN for the third or for joining external APs.
+
+---
+
+## WAN slot configuration — every field explained {#wan-slot-fields}
+
+When you edit a WAN slot in **LuCI → System → OpenMPTCProuter → Settings**, you're presented with a dense form. Most fields are wrong by default for the typical "phone tether" or "home Ethernet" use case. Here's what each field actually does and what to set it to.
+
+| Field | Default | What to set | Why |
+|---|---|---|---|
+| **Label** | empty | any short string ("S25 hotspot", "Home eth", "OnePlus USB") or leave blank | Cosmetic only. Shows on dashboard cards so future-you can tell paths apart. |
+| **Type** | `MacVLAN` | **`Normal`** | MacVLAN creates a virtual interface stacked on a physical one — only useful when one physical port carries multiple VLAN-tagged uplinks (e.g., a single switch port feeding several modems). The Beryl AX has no such setup. Normal binds the WAN to a real physical interface directly. |
+| **Protocol** | `Static address` | **`DHCP client`** for tethers, Wi-Fi-as-WAN, and most home connections; Static only if your ISP gave you a fixed IP block | Static needs IP/netmask/gateway fields filled in — leave-them-blank-and-Static is the most common "No IP defined" cause. |
+| **Physical interface** | logical name like `wan1` (wrong) | A real **kernel netdev name**: `eth0`, `eth1`, `usb0`, `phy0-sta0`, `phy1-sta0` | The "logical" names in the dropdown are circular references (wan1's physical = wan1). Pick the actual kernel device. See troubleshooting if `phy0-sta0` doesn't appear — usually a hard refresh fixes it. |
+| **VLAN** | empty | empty | Only used with VLAN-tagged uplinks. Irrelevant for tethers and standard home connections. |
+| **Multipath TCP** | `Disabled` | **`On`** for active bonded paths; **`Backup`** for hot-spare paths; **`Off`** to remove from the bond | Disabled = MPTCP doesn't use this path at all. On = active subflow contributing to bonded throughput. Backup = subflow only activates when On paths fail (clean failover with no airtime/data cost in normal operation). Master = MPTCP initiates new connections here; one Master per bond. |
+| **Force TTL** | empty | **`65`** for cellular tethers; leave empty for home Ethernet | Carriers (Verizon, AT&T) detect tethering by checking IP TTL — phone-originated traffic has TTL 64-65, tethered traffic from a downstream device has lower TTL (each hop decrements). Forcing TTL to 65 on egress makes tethered traffic look like it originated on the phone. Bypasses the throttle on detection-enabled plans. Harmless if your carrier doesn't check. |
+| **MPTCP over VPN** | unchecked | **unchecked** unless your carrier blocks MPTCP at the network layer | Wraps the MPTCP subflow inside a VPN to disguise it. Almost never needed — most carriers don't filter MPTCP. Check this only if you've verified MPTCP itself is being blocked (rare). |
+| **Enable SQM** | unchecked | **unchecked** for cellular WANs; **checked** for stable home Ethernet (with calibrated rates) if you observe bufferbloat | SQM controls bufferbloat by under-shaping the egress rate to keep queues empty. Needs a known stable bandwidth to calibrate against. Cellular bandwidth is too variable. See § SQM with cellular WANs. |
+| **Enable SQM autorate** | unchecked | usually **unchecked** | Requires the `cake-autorate` package (not in stock OMR). Adds latency-based rate auto-adjustment. Useful for stable LTE links but adds CPU + maintenance cost. Skip unless you've committed to SQM-on-cellular. |
+| **Calculate speed** | unchecked | **unchecked** unless SQM is on | Runs an automatic speedtest to populate the Download/Upload fields. Only useful when SQM needs rate values. |
+| **Download speed (Kb/s)** | 0 | leave 0 unless SQM is on | Used by Glorytun UDP rate shaping and by SQM. Setting it without SQM gates Glorytun UDP throughput. |
+| **Upload speed (Kb/s)** | 0 | leave 0 unless SQM is on | Same as above. |
+
+**One field is missing from most discussions but matters:** the WAN's **MPTCP role within the bond**, sometimes a separate dropdown on the OMR Settings page or accessible via `uci show openmptcprouter`. Values are typically:
+
+- **Master** — the path that initiates new TCP connections. Choose your fastest, most reliable, lowest-latency WAN. One Master per bond.
+- **On** — active subflow. Joins after Master establishes the connection. Contributes to bonded throughput.
+- **Backup** — subflow defined but inactive until an On/Master path fails.
+- **Off** — defined but not part of the bond.
+
+A typical 3-WAN cruise/travel build:
+
+| WAN | Type | Protocol | Physical | MPTCP role | Force TTL |
+|---|---|---|---|---|---|
+| `wan1` (home eth0) | Normal | DHCP | eth0 | **Master** | empty |
+| `wan2` (OnePlus USB) | Normal | DHCP | usb0 | **On** | 65 |
+| `wan3` (S25 Wi-Fi) | Normal | DHCP | phy0-sta0 | **On** | 65 |
+
+---
+
+## Wi-Fi-as-WAN deep dive {#wifi-as-wan-deep-dive}
+
+Wi-Fi-as-WAN is when the Beryl is a *client* of another AP — joining a phone hotspot, cruise wifi, hotel wifi, family Wi-Fi at someone's house — and that joined connection becomes one of the bonded WAN paths.
+
+### Configuration flow: Scan + Join Network
+
+The right way to set this up isn't the Mode dropdown — that requires hand-entering BSSID, encryption, password. Instead:
+
+1. **Wireless Overview** → on the radio you want as a client, click **Scan**
+2. Find the upstream SSID in the scan results → click **Join Network**
+3. Dialog:
+   - **WPA passphrase:** the upstream's password
+   - **Name of the new network:** descriptive — `wwan_s25`, `wwan_home`, `wwan_cruise`
+   - **Firewall zone:** `wan` (critical — putting it on `lan` makes the Beryl unable to use it as a WAN)
+4. Submit → Save & Apply on the parent page
+
+LuCI auto-creates the wifi-iface section in Client mode, sets the right encryption, links it to the named network.
+
+### Mode and channel — the AP dictates, but defaults matter
+
+In Client mode, the **AP** (the phone, the cruise router) chooses mode and channel. The Beryl just speaks whatever's broadcast. So the Mode dropdown in the Client edit dialog isn't truly authoritative — it sets the client's capability, not the channel that gets used.
+
+Practical defaults:
+- **Mode = N** for radio0 (2.4GHz) — broadest compatibility with phone hotspots. AX in client mode is fine but no benefit because the cellular pipe behind the hotspot is your bottleneck.
+- **Channel** — auto. Don't pin a channel for client mode; the AP picks.
+
+### Why 2.4GHz hotspot beats 5GHz hotspot for Wi-Fi-as-WAN
+
+Counter-intuitive but: **prefer a 2.4GHz phone hotspot for Wi-Fi-as-WAN over 5GHz**, even though 5GHz is faster on paper.
+
+- **2.4GHz N (~130 Mbit/s link rate) is already faster than your cellular pipe.** Most phone hotspots backhaul 50-300 Mbps cellular. 2.4GHz delivers plenty for that.
+- **5GHz client mode hits DFS channels (52-144) which require radar avoidance.** Some phones pick a DFS channel for hotspot; some Beryl drivers handle it cleanly, others silently fail to associate or drop randomly.
+- **5GHz range is shorter.** If the phone moves to a different pocket or backpack, 2.4GHz tolerates the change; 5GHz might drop.
+- **5GHz is congested in dense areas** (conferences, cruise ships) — 2.4GHz, while noisier, is more reliable for low-throughput control.
+
+Set your phone hotspots to 2.4GHz mode for hotspot-as-WAN use.
+
+### Country Code on client interfaces
+
+Set the Country Code explicitly on the wifi-iface (not just the radio). Set to your actual country (e.g., **US - United States**). Default is "driver default" which can resolve to `00` (world domain) and prevent association — same root cause as the AP-side bug documented in troubleshooting.
+
+### Multiple upstream candidates — `travelmate`
+
+Vanilla OpenWrt's Wi-Fi-as-WAN is **one configured upstream per radio**. To switch, you change the SSID in the wifi-iface and reload. Clunky if you switch often.
+
+**`travelmate`** is an OpenWrt package designed for travel routers with multiple known upstreams. You preconfigure a prioritized list: S25 hotspot, OnePlus hotspot, home Wi-Fi, mom's house, common coffee shops. The daemon scans periodically and joins the highest-priority available SSID. When that drops, it falls back to the next.
+
+**Install:**
+
+```bash
+ssh root@192.168.100.1
+apk update
+apk add travelmate luci-app-travelmate
+/etc/init.d/travelmate enable
+/etc/init.d/travelmate start
+```
+
+(If `apk search travelmate` returns nothing, the OMR repos may not have it yet — fall back to manual SSID switching.)
+
+**Configure:** LuCI → Services → Travelmate → Add Uplink. Each entry: SSID, password, priority. Lower priority number = preferred.
+
+Example prioritization for a nomad/cruise build:
+
+| Priority | SSID | Why |
+|---|---|---|
+| 1 | Home Wi-Fi | Fastest free path when in range |
+| 2 | KENNETH's S25 | Primary cellular WAN candidate |
+| 3 | OnePlus Hotspot | Secondary cellular WAN |
+| 4 | (preconfigured cruise SSID) | Auto-join when boarding |
+| 5 | (preconfigured hotel SSIDs) | Auto-join at known hotels |
+
+After install, switching between WANs is automatic — the Beryl just finds the best available upstream. Combined with phone-tether-on-eth0 swap, your router adapts to wherever you are without manual reconfiguration.
+
+### Wi-Fi-as-WAN gotchas
+
+- **Phone hotspot timeout.** Some Android builds auto-disable hotspot after N minutes of no activity. With Wi-Fi-as-WAN, the Beryl IS the active client, so this shouldn't trigger — but watch for it on phones with aggressive battery management.
+- **Captive portal.** Hotel/cruise/coffee-shop Wi-Fi often requires login. The Beryl associates but no internet until you complete the captive portal in a browser on a LAN client. Plug a laptop in, open the portal page, log in once — applies to all LAN clients afterward.
+- **MAC filtering.** Some networks bind sessions to MAC. If you reboot the Beryl mid-session, you may need to re-do captive portal login because OpenWrt's STA MAC stays consistent but session state on the AP side resets.
+- **MAC randomization.** OpenWrt 23+ supports STA MAC randomization. Off by default; can be enabled per wifi-iface. Useful for privacy but breaks MAC-bound sessions.
+
+---
+
+## Multiple WANs to the same upstream {#multiple-wans-same-upstream}
+
+A common question once you have Wi-Fi-as-WAN working: "if I'm home, can I have both `eth0` (wired to home router) AND `wwan_home` (Wi-Fi to the same home router) configured at the same time?"
+
+**Short answer: yes, no conflict, but it's redundancy not throughput multiplication.**
+
+### What works
+
+OMR uses per-WAN routing tables (mark-based routing). Each WAN gets its own routing table; the kernel uses fwmark to direct traffic via the right interface. Two interfaces with IPs on the same subnet (both 192.168.1.x from your home router's DHCP) don't fight because they're explicitly bound to their own tables:
+
+```
+ip rule show
+# Includes:
+#   100: from <eth0 IP> lookup wan1_table
+#   101: from <phy0-sta0 IP> lookup wwan_home_table
+
+ip route show table wan1_table
+#   default via 192.168.1.1 dev eth0
+ip route show table wwan_home_table
+#   default via 192.168.1.1 dev phy0-sta0
+```
+
+Both paths function. MPTCP can use both as subflows. ARP works fine because the MACs differ. The home router happily DHCPs two addresses to two MACs on its LAN.
+
+### What you actually get
+
+- **Same public IP egress.** Both paths exit through your home router's WAN port → ISP → public IP. From the VPS's perspective, both subflows arrive from the same IP. No aggregation benefit beyond what one path delivers.
+- **Same upstream bottleneck.** Bonded throughput is capped at the home ISP's bandwidth, no matter how many parallel Beryl-to-router paths exist.
+- **Redundancy.** If the Ethernet cable is unplugged or eth0 link drops, the Wi-Fi subflow continues. MPTCP's connection-survival property means live TCP sessions don't die.
+
+### Recommended configuration if you do this
+
+| WAN | Role | Effect |
+|---|---|---|
+| `eth0` (home wired) | **Master** | Default for new connections. No airtime cost, low latency. |
+| `wwan_home` (home Wi-Fi) | **Backup** | Idle while Master works. Activates within ~10 sec if Ethernet drops. |
+
+`Backup` mode means no actual traffic uses the wireless-to-home path during normal operation. The Beryl maintains association so it's ready to switch instantly if Ethernet dies. Zero data plan impact (it's your own home Wi-Fi). Modest Wi-Fi airtime overhead from association beacons only.
+
+### When the trade isn't worth it
+
+Honestly, for most builds **skip wwan_home and just use eth0 wired**:
+
+- Most home failure modes (router crashed, ISP outage, power blip) take **both** paths down at once. The wireless path doesn't help.
+- The narrow case where wired is broken but wireless to the same router works (e.g., chewed Ethernet cable) is real but rare.
+- Your `radio0` slot is more valuable as a Wi-Fi-as-WAN client for cellular hotspots when you're *away* from home.
+- For mobile-first builds, the redundancy budget is better spent on a third cellular WAN than a second path to the same home.
+
+The exception: if you have a known-good reason — Ethernet jack location is inconvenient, basement office with weak Wi-Fi where you want wired-when-possible-Wi-Fi-when-not — then wired Master + wireless Backup is the right pattern. Otherwise: keep it simple.
+
+### Same upstream + different schedulers
+
+This is where it gets interesting. With MPTCP scheduler = `redundant`, both eth0 and wwan_home would carry **every packet** in parallel — the destination de-duplicates at the kernel layer. For latency-critical workloads (VDI sessions, voice calls) this gives zero-packet-loss failover even on millisecond drops. Doubles your Beryl→router traffic and your Wi-Fi airtime cost, but the throughput cap is still home ISP bandwidth.
+
+Useful for "I cannot have my Zoom drop during a presentation, even briefly." Wasteful otherwise.
+
+---
+
+## SQM with cellular WANs — when to bother {#sqm-with-cellular-wans}
+
+SQM (Smart Queue Management, using the `cake` algorithm) prevents bufferbloat — the bloat in upstream queues that makes loaded latency 200ms+ when an idle link is 20ms. With SQM correctly calibrated, loaded latency stays within 10ms of unloaded.
+
+**The catch:** SQM works by shaping egress to slightly *under* your real bandwidth, keeping queues empty in upstream hardware (ISP modem, cell tower) where you can't control them. The rate you set has to match real bandwidth. Set too high → SQM does nothing because the bottleneck is upstream. Set too low → you self-throttle.
+
+### Why SQM is hard for cellular WANs
+
+Cellular bandwidth is variable: signal strength, tower congestion, time of day, weather all shift the available throughput by 30-90% over a single day. A static SQM rate that's correct at 8am is wrong by 8pm.
+
+Two responses:
+
+1. **Static conservative rate.** Set SQM to ~50% of your worst-case observed cellular throughput. You leave bandwidth on the floor most of the time, but you keep latency tame.
+2. **`cake-autorate` dynamic adjustment.** A shell script (not in stock OMR; install with `apk add cake-autorate`) pings a known host continuously and adjusts SQM rate based on observed latency. Tracks moving bandwidth at the cost of extra CPU + complexity.
+
+Neither is great. Reasonable verdict for most builds: **SQM off on cellular WANs.**
+
+### When SQM is worth turning on
+
+| WAN type | SQM recommendation | Why |
+|---|---|---|
+| Home Ethernet (cable/fiber) | **On**, rate = measured speed × 0.9 | Stable enough to calibrate once. Big bufferbloat win on cable/DSL. |
+| Home Ethernet (Starlink) | **On**, rate = measured speed × 0.8 | Starlink has known bufferbloat (~200ms loaded → ~30ms with SQM). Recalibrate quarterly as Starlink performance evolves. |
+| Phone Ethernet tether | **Off** | Cellular variability defeats static rates. |
+| Phone USB tether | **Off** | Same. |
+| Wi-Fi-as-WAN (phone hotspot) | **Off** | Same + Wi-Fi link adds another variable. |
+| Wi-Fi-as-WAN (joining cable/fiber router) | **Maybe**, rate = measured ÷ 2 | The Beryl is doubly behind a queue (Wi-Fi link + the other router's WAN). Only helps if Wi-Fi link itself is the bottleneck. Usually not. |
+
+### How to tell if you have a bufferbloat problem
+
+From a LAN client (laptop, phone) while the Beryl is your gateway:
+1. Open [Waveform's bufferbloat test](https://www.waveform.com/tools/bufferbloat)
+2. Note "Unloaded latency" and "Loaded latency"
+3. **Loaded > 150ms = bufferbloat present, SQM would help**
+4. **Loaded < 50ms = your existing path is well-managed, SQM is overkill**
+5. Repeat per WAN by temporarily disabling others.
+
+### SQM and MPTCP interaction
+
+SQM operates at the per-physical-interface layer. MPTCP runs above it. No inherent conflict — SQM shapes each WAN's egress; MPTCP aggregates the resulting smoothed pipes. The decision is per-WAN, not per-bond.
+
+---
+
+## Verifying all WANs are actively bonded {#verifying-bonded-wans}
+
+After configuration, the question becomes: are all WANs actually carrying packets, or is one configured-but-idle? Three layers of evidence, increasing rigor.
+
+### Layer 1: Dashboard visual
+
+**LuCI → Dashboard** and **Status → OpenMPTCProuter**:
+- Each WAN card should be **green**
+- Each card should show a **distinct public IP** (different ISPs, different CGNAT ranges)
+- `omrvpn` card green + the VPS's public IP shown as your egress
+- Per-WAN throughput graphs should update during a sustained download
+
+What this tells you: WANs are *configured and reachable*. It does **not** tell you they're actively carrying packets right now.
+
+### Layer 2: Byte counter live watch
+
+```bash
+ssh root@192.168.100.1
+watch -d -n 1 'echo "=== eth0 (home) ==="; grep eth0 /proc/net/dev; \
+                echo "=== usb0 (OnePlus) ==="; grep usb0 /proc/net/dev; \
+                echo "=== phy0-sta0 (S25 Wi-Fi) ==="; grep phy0-sta0 /proc/net/dev'
+```
+
+(`-d` highlights changed digits between refreshes — makes deltas obvious.)
+
+From a LAN client, start a sustained download:
+
+```bash
+# A speedtest, or:
+curl -o /dev/null https://speed.cloudflare.com/__down?bytes=10000000000
+```
+
+All three WANs should show RX byte counters incrementing simultaneously. **If only one increments, only one WAN is actually being used right now** — the others are configured but idle. That usually means:
+- MPTCP scheduler = `default` (assigns based on RTT/throughput, may pin to fastest path under low load)
+- Or one of the supposed-On WANs is silently down at L2/L3 (despite dashboard green from a stale check)
+
+To force all WANs into use, switch scheduler to `roundrobin` temporarily:
+
+```bash
+uci set network.globals.mptcp_scheduler='roundrobin'
+uci commit network
+/etc/init.d/network restart
+```
+
+Re-run the speedtest. If all three counters now move, the WANs are bonded; `default` scheduler was just being efficient (no need to spray a small download across multiple paths). Switch back to `default` after testing if that's what you prefer.
+
+### Layer 3: MPTCP subflow introspection
+
+The strongest evidence — ask the kernel directly which subflows are part of an active MPTCP socket:
+
+```bash
+ssh root@192.168.100.1
+
+# Registered MPTCP endpoints (one per WAN, populated by OMR)
+ip mptcp endpoint show
+
+# Active MPTCP sockets with subflow detail
+ss -tiM | head -40
+
+# MPTCP-wide counters
+nstat -a | grep -i mptcp
+# Key counters:
+#   MPTcpExtMPCapableSYNTX   — MPTCP-enabled SYNs you sent
+#   MPTcpExtMPCapableACKRX   — server agreed to MPTCP
+#   MPTcpExtMPJoinSynRx      — additional subflows joining the connection
+#   MPTcpExtMPJoinAckTx      — you ACKed a subflow join
+```
+
+`MPJoinSynRx > 0` and `MPJoinAckTx > 0` are the proof that additional subflows are being established beyond the initial single-path connection. If only `MPCapableSYNTX` increments but `MPJoinSynRx` stays at zero, you're getting MPTCP-capable connections but they're not actually multipathing — usually means the VPS isn't advertising additional addresses, or carrier middlebox is stripping MPTCP options.
+
+### Path-health view from OMR
+
+```bash
+ubus call openmptcprouter status 2>/dev/null | head -80
+# Per-WAN: UP/DOWN, latency to VPS, loss percentage, throughput
+```
+
+This is what powers the dashboard cards. If `ubus` is unavailable, check `logread -f | grep omr-tracker` for the periodic health probes.
+
+---
+
+## Device fleet for a mobile bonded build {#device-fleet}
+
+How many phones, SIMs, cables, batteries do you actually need? This depends on the build's purpose. The framework below covers a "work from anywhere — cruise/RV/hotel/home" use case.
+
+### The minimum viable kit
+
+| Item | Count | Why |
+|---|---|---|
+| Travel router (Beryl AX or equivalent) | 1 | The bonding endpoint |
+| Phones with hotspot/tether capability | 2 | Primary cellular WAN + backup carrier. Single phone = single point of failure on the cellular side. |
+| Active SIM/eSIM plans | 2 | One per phone, ideally on different carriers (carrier diversity > path count) |
+| USB-A to USB-C cables (for tether) | 2 | One for active tether, one spare. Cheap cables drop link under load. |
+| USB-C to Ethernet adapter | 1 | For Ethernet-tether option (better link stability than USB tether) |
+| USB-C charger or battery pack for the phones | 2 | Tethering keeps the cellular radio + USB peripheral hot; phones drain fast. Plug them in while in use. |
+| Beryl power source (USB-C PD or 12V DC adapter) | 1 + spare | Don't be stuck with a broken charger on day one of a trip |
+
+### The recommended kit (what I'd actually carry)
+
+| Item | Count | Why |
+|---|---|---|
+| Beryl AX | 1 | + a spare Beryl if traveling for weeks; they're $80 and shipping replacements is hard from a cruise |
+| Phones (different OSes ok) | 2-3 | 2 = minimum, 3 = comfortable. Each one is a redundant uplink + carrier. |
+| Active plans on different carriers | 3 | Verizon + T-Mobile + AT&T (or country equivalent). Different MVNO upstreams count if different. |
+| Spare SIM tray pin | 1 | Trivial cost, prevents the "I can't activate my backup SIM because no pin" stress |
+| USB-A to USB-C cables | 3-4 | Stuff happens. One reliably-good Anker per active tether + spares. |
+| USB-C to Ethernet adapters | 1-2 | Anker / UGREEN / CalDigit. Cheap ones drop link under sustained load. |
+| Powered USB-A hub (if going past 2 USB tethers) | 0-1 | Optional. Only if you want >2 USB-tethered phones simultaneously. |
+| Battery pack (10000+ mAh) | 1-2 | For phone charging mid-day. Each tethered phone drains 30-50% per hour under load. |
+| Charger bricks | 2-3 | One for Beryl, one for each phone. PD-capable so they can fast-charge during use. |
+| Ethernet cable | 1-2 | For wired LAN to laptop when stationary, or for Ethernet-tethering tests |
+
+### Carrier diversity — pick three different upstreams
+
+The resilience math is **different carriers**, not different plans. Three Mint plans (all T-Mobile MVNO) survive zero T-Mobile outages. One Mint + one Cricket + one US Mobile Warp 5G survives any single-carrier outage.
+
+US MVNO upstream map (verify quarterly — it shifts):
+- **T-Mobile network:** Mint, US Mobile GSM, Google Fi (primarily), Metro PCS
+- **Verizon network:** Visible, US Mobile Warp 5G, Total Wireless
+- **AT&T network:** Cricket, AT&T Prepaid, Consumer Cellular (AT&T side)
+
+International builds: pick three carriers from the local market. EE / Vodafone / O2 in the UK, Bell / Telus / Rogers in Canada, etc. For cruise/cross-border travel, eSIM services like Airalo or GigSky give you on-demand local data but tend to be expensive and slow — they're an addition to, not a replacement for, your home-country carriers.
+
+### Why not more than 3 phones for the bond
+
+- **Beryl CPU ceiling.** ~600-800 Mbps aggregate bonded throughput. Three modest cellular WANs already saturate.
+- **VPS encryption ceiling.** Same range on a 1-vCPU $6 droplet. Upgrade to 2-vCPU ($12) if you need more.
+- **Data plan economics.** Each plan is $15-40/mo. Three plans is reasonable insurance; five is hobbyist territory.
+- **Physical bulk.** Three phones + their cables + their chargers is already a small bag. Each additional phone is another charge cycle to track.
+- **Complexity tax.** More paths = more failure modes = more 3am debugging on a cruise ship.
+
+### Phone selection criteria
+
+Optimizing for tethering use:
+- **5G/LTE support on multiple bands** — single-band phones miss carrier coverage in some areas
+- **Ethernet tethering support** — Samsung yes, OnePlus mostly yes, Pixel yes, iPhone no
+- **USB tethering quality** — all Androids do RNDIS; quality varies by build
+- **Hotspot mode reliability** — older phones may auto-disable hotspot aggressively
+- **Battery capacity** — bigger = longer tether sessions between charges
+- **Heat management** — phones that throttle under sustained cellular use drop tether speed silently
+
+A practical fleet: **flagship Samsung** (best ethernet tether), **flagship OnePlus** (good USB tether), **older spare Android** (cold backup, different carrier). Avoid making iPhones primary tether sources — no Ethernet tether option is a real limitation.
+
+### Spares and resilience scaling
+
+For a long trip (weeks) or critical work (live broadcasts, on-call), add:
+- A **spare Beryl AX** ($80, pre-configured identically) — failover device if the primary fails
+- A **second VPS** in a different region (warm standby, replicate config) — failover if the primary VPS region goes down
+- A **spare USB hub + adapters kit** — cables and adapters fail more than anything else
+
+Don't carry these for casual travel; they're 0.5 lb of insurance for someone whose income depends on always-on connectivity.
+
+### Why fewer devices than you'd think — the law of diminishing return
+
+You can construct a 5-WAN bond on the Beryl AX. You usually shouldn't:
+- After 3 paths, throughput stops growing (CPU-bound)
+- Each path past 3 is another battery to charge, cable to track, plan to pay for
+- The marginal resilience from a 4th path is small if the first 3 cover different carriers
+- Maintenance burden compounds: more devices = more updates = more "why did this one suddenly stop working"
+
+The 80/20 build: **Beryl + 2 phones + Ethernet-tether-capable Samsung + diverse-carrier SIMs.** Add a 3rd phone or SIM only if you've experienced enough outages to justify it.

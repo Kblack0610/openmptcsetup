@@ -18,6 +18,7 @@ matches what you're trying to do.
 | Prove the tunnel works / measure throughput / verify Tailscale-direct | [`testing.md`](testing.md) |
 | Day-to-day monitoring — "show me what the system is doing right now" | [`playbook.md`](playbook.md) |
 | Diagnose a specific failure / red dashboard card | [`troubleshooting.md`](troubleshooting.md) |
+| Persist your OMR settings as code (backup + restore + declarative `uci` script) | [`runbooks/settings-persistence.md`](runbooks/settings-persistence.md) |
 
 ## Map
 
@@ -31,9 +32,10 @@ docs/
 ├── why-vps.md               ← long-form architectural rationale
 ├── vps-options.md           ← provider comparison (DigitalOcean / Vultr / Linode / Hetzner / etc.)
 └── runbooks/
-    ├── beryl-ax.md          ← primary build (GL.iNet GL-MT3000, official OMR image)
-    ├── cruise-checklist.md  ← condensed offline field guide for hotel + cruise
-    └── r6s.md               ← alternative build (NanoPi R6S, vanilla OpenWrt + OMR feeds)
+    ├── beryl-ax.md             ← primary build (GL.iNet GL-MT3000, official OMR image)
+    ├── cruise-checklist.md     ← condensed offline field guide for hotel + cruise
+    ├── r6s.md                  ← alternative build (NanoPi R6S, vanilla OpenWrt + OMR feeds)
+    └── settings-persistence.md ← persisting OMR settings as code — backup, restore, declarative
 ```
 
 ## Reading order for someone new

@@ -24,6 +24,9 @@ Sections:
 17. [Wireless Overview shows "Encryption: None" but you set WPA2](#encryption-none-after-save)
 18. [Which radio is which? I have `radio0` and `radio1` backwards](#radio-mapping-confused)
 19. [Phone associates to Wi-Fi but never gets an IP (then drops)](#wifi-no-dhcp-no-bridge)
+20. [USB-tethered phone disconnects every 30-60 seconds on its own](#usb-tether-cycle)
+21. [Wi-Fi STA exists in `iw dev` but missing from OMR Physical interface dropdown](#sta-missing-from-omr-dropdown)
+22. [Only one WAN's byte counters move during a speedtest, others idle](#single-wan-only-moves)
 
 ---
 
@@ -613,3 +616,134 @@ logread -f | grep -iE 'dnsmasq|dhcp'
 In Wireless Overview's Associated Stations, your phone's actual MAC should now appear as a real client (not just the AP's `phy1-ap0` entry).
 
 **Why does OMR ship like this?** Most OpenWrt images ship `lan` as a bridge even when it has only one port, precisely so Wi-Fi can be added later without thinking about it. The Beryl AX OMR build for the `gl-mt3000` target ships `lan` as raw `eth1` — works fine until you enable the AP, then you hit exactly this. It's a build quirk, not user error.
+
+---
+
+## USB-tethered phone disconnects every 30-60 seconds on its own {#usb-tether-cycle}
+
+You plug the phone in via USB, enable USB tethering, and `dmesg` on the Beryl looks healthy briefly:
+
+```
+rndis_host 1-1:1.0 usb0: register 'rndis_host' at usb-..., RNDIS device, <MAC>
+```
+
+But ~30-60 seconds later:
+
+```
+usb 1-1: USB disconnect, device number N
+rndis_host ... usb0: unregister 'rndis_host'
+```
+
+And then it re-attaches with a *different MAC* and the cycle repeats every minute. `ip -br addr show usb0` shows `DOWN`, `lsusb` shows the phone present.
+
+**Cause:** the phone is auto-disabling USB tethering because it sees no client actively pulling DHCP from it. The Beryl created the `usb0` kernel device but `netifd` hasn't been told to bring it up — no WAN config slot points at `usb0`. From the phone's perspective: "tether is on, but the connected device isn't using it, so disable it after timeout to save battery." Then the user/OS re-enables, RNDIS re-attaches, cycle repeats. Each new RNDIS gadget instance regenerates a random MAC, which is the smoking gun for this pattern.
+
+**Fix:** configure `usb0` as a WAN in OMR Settings:
+
+1. **LuCI → System → OpenMPTCProuter → Settings**
+2. Pick or add a WAN slot (typically `wan2`)
+3. Type: **Normal**
+4. Protocol: **DHCP client**
+5. Physical interface: **`usb0`**
+6. Multipath TCP: **On**
+7. Force TTL: **65** (recommended for cellular tether)
+8. Save & Apply
+
+Within ~10 seconds `netifd` brings `usb0` UP and starts DHCP. The phone sees a real client pulling DHCP and stops auto-disabling. The dmesg register/unregister cycle stops.
+
+**Verify:**
+
+```bash
+ssh root@192.168.100.1
+ip -br addr show usb0
+# Expect:  usb0  UP  192.168.42.x/24   (the phone's RNDIS subnet)
+dmesg | tail -5
+# No new register/unregister events
+```
+
+**Not the cause but easy to chase:** the occasional `xhci-mtk: ERROR: unexpected setup context command completion code 0x11` lines in dmesg are a USB controller hiccup, often cable-marginal but harmless if RNDIS attaches cleanly after them. Don't chase the xhci errors unless the register/unregister cycle continues *after* the WAN config is in place — at that point, swap the cable to an Anker/UGREEN known-good one.
+
+---
+
+## Wi-Fi STA exists in `iw dev` but missing from OMR Physical interface dropdown {#sta-missing-from-omr-dropdown}
+
+You've set up Wi-Fi-as-WAN via the Scan + Join Network flow. **LuCI Network → Wireless** shows the Client entry as connected (Signal -27 dBm, IP from the upstream hotspot). `iw dev` shows `phy0-sta0 type managed` with the right SSID. But back on **System → OpenMPTCProuter → Settings**, the Physical interface dropdown only offers `eth0 / eth1 / usb0 / br-lan / phy1-ap0` — **no `phy0-sta0`**.
+
+**Cause:** the OMR Settings page builds its Physical interface dropdown from the kernel's interface list at page load time. If you opened the Settings page *before* the wifi STA was up, the dropdown is stuck on the stale list. A normal browser reload may serve cached HTML.
+
+**Fix #1 (try this first):** **Hard refresh** the OMR Settings page:
+- Linux/Windows: **Ctrl + Shift + R** (or Ctrl + F5)
+- Mac: **Cmd + Shift + R**
+
+Then re-open the WAN slot edit. `phy0-sta0` should now appear in the dropdown.
+
+**Fix #2 (if #1 doesn't work):** some OMR build versions filter wifi STA interfaces out of the WAN-slot dropdown. SSH workaround — bind directly with `uci`:
+
+```bash
+ssh root@192.168.100.1
+
+# Confirm the slot number you want to use (usually wan3 if wan1=home, wan2=usb0)
+uci show openmptcprouter | grep -E "^openmptcprouter\.wan[0-9]"
+
+# Create / configure the slot
+uci set openmptcprouter.wan3=interface
+uci set openmptcprouter.wan3.iface='phy0-sta0'
+uci set openmptcprouter.wan3.label='S25 Wi-Fi'
+uci set openmptcprouter.wan3.multipath='on'
+uci set openmptcprouter.wan3.ttl='65'
+uci commit openmptcprouter
+
+# Make sure the wwan_s25 network is DHCP (LuCI usually sets this from Scan+Join)
+uci show network | grep -A 5 wwan_s25
+# If proto isn't 'dhcp':
+uci set network.wwan_s25.proto='dhcp'
+uci commit network
+
+/etc/init.d/network reload
+```
+
+**Verify the slot took:**
+
+```bash
+uci show openmptcprouter.wan3
+# Should show iface='phy0-sta0', multipath='on', ttl='65'
+ip route show table all | grep phy0-sta0
+# Should show a default route via the phone's gateway
+```
+
+**Why the dropdown filter happens at all:** historically OMR's settings page expected WAN sources to be physical hardware ports, not virtual wifi interfaces. The kernel-name + DHCP approach via `uci` does the right thing regardless of UI surface.
+
+---
+
+## Only one WAN's byte counters move during a speedtest, others idle {#single-wan-only-moves}
+
+You have 2-3 WANs configured and showing green on the dashboard. You SSH in and `watch -d` the byte counters across `eth0`, `usb0`, `phy0-sta0`. You run a speedtest from a LAN client. Only `eth0` (or only one of them) increments noticeably; the others stay near zero.
+
+**This is usually not a bug** — it's MPTCP scheduler behavior. The `default` scheduler ranks subflows by RTT and CWND, and for small or single-flow workloads it'll prefer the fastest path until it saturates. A 30-second download might not be long enough or fat enough to spill onto additional paths.
+
+**Verify it's a scheduler decision, not a broken WAN:**
+
+```bash
+ssh root@192.168.100.1
+uci get network.globals.mptcp_scheduler
+
+# Temporarily switch to round-robin (forces all paths into use):
+uci set network.globals.mptcp_scheduler='roundrobin'
+uci commit network
+/etc/init.d/network restart
+```
+
+Re-run the speedtest. If all three counters now move evenly, your WANs are bonded fine; `default` was just optimizing for the workload. Switch back to `default` (or keep `roundrobin` if you want even distribution at some throughput cost):
+
+```bash
+uci set network.globals.mptcp_scheduler='default'
+uci commit network
+/etc/init.d/network restart
+```
+
+**If `roundrobin` still doesn't move the other WANs**, that's a real problem. Diagnose in this order:
+
+1. **Path-tracker health.** `ubus call openmptcprouter status 2>/dev/null | head -80` — look for the per-WAN UP/DOWN, latency, loss. Any WAN reporting DOWN or high loss is excluded from the bond regardless of dashboard green status.
+2. **MPTCP endpoints registered.** `ip mptcp endpoint show` — each WAN's local IP should be listed as an endpoint. Missing endpoint = MPTCP can't use that path. Re-Save & Apply OMR Settings to re-register.
+3. **VPS advertising multiple addresses.** `nstat -a | grep MPTcpExtMPJoinSynRx` — should be incrementing during multi-path connections. If zero, the VPS isn't telling clients "here are my other addresses, join subflows there" — check VPS config (`mptcpd` running, `/etc/mptcpd/mptcpd.conf` has the right addresses).
+4. **Carrier middlebox stripping MPTCP options.** Some cellular carriers strip the MPTCP options out of TCP headers, breaking subflow establishment. Verify by `tcpdump -i usb0 -nn 'tcp[tcpflags] & tcp-syn != 0' -X` and checking the option bytes for the MPTCP "OK" marker. If stripped, enable **MPTCP over VPN** on that WAN's OMR slot (wraps the subflow in another VPN to hide MPTCP from the carrier).

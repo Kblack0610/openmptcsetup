@@ -1,8 +1,17 @@
 # VPS Options for OMR Endpoint
 
-## TL;DR — Vultr LAX is the right default
+## TL;DR — DigitalOcean SFO3 or Vultr LAX, both fine
 
-For most US-West-coast users running OMR for VDI/Moonlight, **Vultr Cloud Compute in Los Angeles, $6/mo, Debian 12** is genuinely the cleanest pick. The rest of this doc explains why, and when you might pick something else.
+This repo's scripts (`vps-create-do.sh` / `vps-install.sh`) default to **DigitalOcean SFO3,
+$6/mo, Debian 12**. **Vultr LAX** is the equally-clean alternative that the rest of this
+doc was originally written around — same price tier, ~5-15ms RTT to SoCal, KVM, high ports
+open, no DPI nonsense. Pick whichever you already have an account at. The rest of this doc
+explains the requirements any VPS must satisfy, why Vultr/DO win, and when you might pick
+something else.
+
+> The original recommendation in this doc was Vultr LAX. The scripts ended up on DO SFO3
+> because the author already had `doctl` authenticated for another project. Either is right
+> for a SoCal-anchored bonding endpoint.
 
 ---
 

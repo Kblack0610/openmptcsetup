@@ -1,19 +1,15 @@
-# OMR Setup — Beryl AX + Vultr LAX
+# openmptcsetup
 
-Channel-bonding router build for combining Starlink + cellular + (optional cruise/hotel wifi) into a single low-latency tunnel for VDI and Moonlight.
+Channel-bonding router build that combines multiple internet links (home + cellular +
+Starlink + cruise/hotel wifi) into a single low-latency tunnel for VDI, Moonlight game
+streaming, and travel use.
 
-## Files in this repo
+The implementation is **[OpenMPTCProuter (OMR)](https://www.openmptcprouter.com/)** on a
+**[GL.iNet GL-MT3000 (Beryl AX)](https://www.gl-inet.com/products/gl-mt3000/)** travel
+router, with a $6/mo **DigitalOcean** VPS as the bonding endpoint.
 
-| File | What it is |
-|---|---|
-| `RUNBOOK-BerylAX.md` | **Primary build guide.** GL.iNet GL-MT3000 (Beryl AX) with official OMR firmware. Recommended path. |
-| `RUNBOOK-R6S.md` | Alternative build for NanoPi R6S (more complex, more capable). Kept for future expansion. |
-| `VPS-options.md` | VPS provider comparison and Vultr LAX recommendation. |
-| `Runbook_short.md` | High-level checklist version of the runbook. |
-| `why-vps.md` | Explainer: why a public reassembly endpoint is required for true bonding. |
-| `bootstrap.sh` | Downloads the official OMR Beryl AX firmware, verifies SHA256, stages SSH keys. |
-| `vps-create-do.sh` | Provisions the VPS on DigitalOcean (SFO3, $6/mo) via doctl. |
-| `vps-install.sh` | SSHes into the fresh VPS and installs the OMR server. |
+> **New here?** Start with [`docs/`](docs/) — it has a reading-order guide and an index.
+> Or skip to [`docs/runbooks/beryl-ax.md`](docs/runbooks/beryl-ax.md) for the primary build.
 
 ---
 
@@ -22,56 +18,105 @@ Channel-bonding router build for combining Starlink + cellular + (optional cruis
 ```bash
 cd ~/dev/openmptcsetup
 
-# 1. Local prep — downloads firmware, generates SSH key
+# 1. Local prep — downloads + verifies Beryl AX firmware, generates SSH key
 ./bootstrap.sh
 
-# 2. Create the VPS on DigitalOcean via doctl (SFO3, $6/mo)
-#    Writes VPS_IP to ./.env automatically and chains into vps-install.sh
+# 2. Create the VPS on DigitalOcean (SFO3, $6/mo) and install OMR server on it
+#    Writes VPS_IP to ./.env, then writes Server IP + key to ./vps-credentials.txt
 ./vps-create-do.sh
 
 # 3. Flash the Beryl AX with the firmware in ./firmware/
-#    See RUNBOOK-BerylAX.md Phase 3 for the exact steps
+#    See docs/runbooks/beryl-ax.md Phase 3 for the exact steps
+#    (or docs/runbooks/cruise-checklist.md if you're racing the clock)
 
-# 4. Configure OMR via LuCI wizard at http://192.168.100.1
-#    See RUNBOOK-BerylAX.md Phase 4 onward
+# 4. Configure OMR via LuCI at http://192.168.100.1
+#    docs/runbooks/beryl-ax.md Phase 4 onward
 ```
 
-Alternative: if you'd rather click through the DO web console (or use Vultr), run `./bootstrap.sh`, manually deploy the VPS, then `echo "VPS_IP=<ip>" > .env && ./vps-install.sh`.
+Manual / non-doctl path: `./bootstrap.sh`, deploy a Debian 12 droplet via the web console,
+then `echo "VPS_IP=<ip>" > .env && ./vps-install.sh`. Vultr LAX, Linode Fremont, or any
+KVM-virtualized Debian 12 host with native IPv4 + high-port-friendly firewall works — see
+[`docs/vps-options.md`](docs/vps-options.md).
 
 ---
 
-## Architecture
+## Topology
 
 ```
-[Starlink Mini] ──ethernet──► Beryl AX WAN port
-[Galaxy S25 USB tether] ──USB-C──► Beryl AX USB
-[Optional 3rd WAN — OnePlus tether via USB hub, cruise wifi via Wi-Fi-as-WAN]
-                                  │
-                          [OMR + Glorytun TCP + Shadowsocks-MPTCP]
-                                  │
-                          [Vultr LAX VPS (Glorytun + SS server)]
-                                  │
-                          [Internet / Tailscale to home Mac Studio]
+[Home internet / Starlink] ──ethernet──► Beryl AX eth0 (WAN slot)
+[Phone USB tether]         ──USB-A 3.0──► Beryl AX usb0
+[Phone 2 hotspot]          ──Wi-Fi──────► Beryl AX wwan (radio1, 2.4GHz client)
+                                              │
+                                              ▼
+                            [OMR + Glorytun TCP + Shadowsocks-MPTCP]
+                                              │
+                                              ▼
+                          [DigitalOcean SFO3 — bonding endpoint]
+                                              │
+                                              ▼
+                            [Internet / Tailscale to home Mac Studio]
 
-Beryl AX 5GHz Wi-Fi ──► [OnePlus client + XREAL Pros]
+Beryl AX 5GHz Wi-Fi (radio0) ──► your laptop, phones-as-clients, etc.
+```
+
+See [`docs/why-vps.md`](docs/why-vps.md) for the architectural rationale (why the VPS is
+required and what it actually does), and [`docs/concepts.md`](docs/concepts.md) for the
+networking concepts the runbooks assume.
+
+---
+
+## Repo layout
+
+```
+.
+├── README.md                       ← this file (project entry point)
+├── bootstrap.sh                    ← local prep: firmware download + SSH key
+├── vps-create-do.sh                ← provision DO droplet, chain into vps-install.sh
+├── vps-install.sh                  ← install OMR server on a Debian 12 host
+├── firmware/                       ← Beryl AX OMR sysupgrade .bin (downloaded by bootstrap)
+└── docs/
+    ├── README.md                   ← documentation index + reading-order guide
+    ├── concepts.md                 ← MPTCP scheduler / role / MacVLAN / TCP-vs-UDP / topology
+    ├── troubleshooting.md          ← symptom-indexed failure modes and fixes
+    ├── why-vps.md                  ← long-form: why bonding requires a public endpoint
+    ├── vps-options.md              ← provider/region comparison
+    └── runbooks/
+        ├── beryl-ax.md             ← primary build (GL-MT3000, official OMR image)
+        ├── cruise-checklist.md     ← condensed offline field guide for hotel + cruise
+        └── r6s.md                  ← alternative build (NanoPi R6S + vanilla OpenWrt)
 ```
 
 ---
 
-## Use case priority
+## Use cases this build serves
 
-1. **Corporate VDI** (Citrix HDX / VMware Horizon Blast) — TCP, jitter-sensitive
-2. **Moonlight game streaming** — UDP, latency-sensitive
-3. **General internet redundancy** — Starlink + cellular failover
+1. **Corporate VDI** (Citrix HDX / VMware Horizon Blast) — jitter-sensitive, run with
+   `redundant` MPTCP scheduler for seamless link-loss survival
+2. **Moonlight game streaming** — latency-sensitive UDP, Tailscale-direct via OMR-ByPass
+3. **General travel redundancy** — Starlink + cellular + hotel/ship wifi, all bonded
 
 ---
 
-## Known gotchas
+## Top-level gotchas
 
-- ⚠️ When flashing the Beryl AX with the OMR sysupgrade image, **UNCHECK "Keep settings"** or you'll brick the boot (different config layouts).
-- ⚠️ OMR's default LAN IP after flashing is `192.168.100.1`, not GL.iNet's stock `192.168.8.1`.
-- ⚠️ Glorytun **UDP** drops Starlink after a few minutes from CGNAT NAT mapping expiry — use Glorytun **TCP** + Shadowsocks-MPTCP for stable bonded sessions.
-- ⚠️ Tailscale-over-OMR collapses to ~5 Mbps without ByPass — always configure OMR-ByPass for Tailscale ports (41641/UDP, 3478/UDP, 443/TCP).
-- ⚠️ For local-LAN traffic (OnePlus to Mac Studio at home), add an OMR-ByPass rule for your home subnet to avoid the unnecessary VPS roundtrip.
+A few things that bite people on first build (full list in
+[`docs/troubleshooting.md`](docs/troubleshooting.md)):
 
-See each runbook's troubleshooting table for more.
+- ⚠️ **Flashing the Beryl AX**: UNCHECK "Keep settings" or you'll brick the boot.
+- ⚠️ **OMR's default LAN IP** after flashing is `192.168.100.1`, not GL.iNet stock `192.168.8.1`.
+- ⚠️ **First LuCI login**: username `root`, **empty password** — just press Enter.
+- ⚠️ **OMR default WAN config is MacVLAN on `eth1`** (your LAN port). Must change Type to
+  Normal, Protocol to DHCP, Physical interface to a real one (`usb0`, `eth0`, `wwan`).
+- ⚠️ **"VPN is not running (empty key)"**: hit Save & Apply again on the Settings page to
+  re-trigger the per-VPN-key auto-fetch from the VPS.
+- ⚠️ **Beryl AX port mapping in OMR**: `eth1` = LAN (2.5GbE port), `eth0` = WAN slot (1GbE
+  port) — opposite of vanilla OpenWrt.
+- ⚠️ **Building from cruise wifi**: ship wifi often blocks the high ports OMR uses. Build
+  from Starlink or cellular, not ship wifi.
+
+---
+
+## License / status
+
+Personal infrastructure project. Scripts are tuned for the author's setup; review before
+running. Not officially affiliated with OpenMPTCProuter or GL.iNet.

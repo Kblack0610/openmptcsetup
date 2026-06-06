@@ -3,7 +3,8 @@
 Self-contained, offline-usable checklist for building the OpenMPTCProuter bonded
 setup on the **GL.iNet GL-MT3000 (Beryl AX)** and running it on an Alaska cruise.
 
-Full detail lives in `RUNBOOK-BerylAX.md`. This file is the condensed field guide —
+Full detail lives in `beryl-ax.md` (sibling). Conceptual background in `../concepts.md`,
+diagnostic recipes in `../troubleshooting.md`. This file is the **condensed field guide** —
 keep it on the laptop because **you won't have good internet to look things up on the ship.**
 
 Hardware: Beryl AX (runs OMR + broadcasts Wi-Fi) · Samsung S25 (USB cellular tether) ·
@@ -71,17 +72,26 @@ Installs OMR, opens the firewall, reboots the VPS (~10 min total).
 ssh root@192.168.100.1
 ip link show usb0     # must exist with an IP
 ```
-✅ **Checkpoint:** `usb0` exists. If not — STOP:
-```bash
-opkg update && opkg install kmod-usb-net-rndis usbutils   # then unplug/replug S25
-```
+✅ **Checkpoint:** `usb0` exists in `ip link`. It will be `state DOWN` with no IP at this stage — that's normal pre-wizard. It only comes up + gets DHCP once configured as a WAN in step 6.
 
-## 6. Run the OMR wizard
-LuCI → **System → OpenMPTCProuter → Wizard**:
-- Server IP + Server Key → paste from `vps-credentials.txt`
-- Default VPN: **Glorytun TCP**; also check **Shadowsocks**
-- Assign **`usb0`** as wan1 (DHCP, enable MPTCP) — Starlink comes on the cruise
-- Save & Apply, wait ~30s.
+> If `usb0` is **missing entirely**, the phone isn't tethering (toggle USB-tethering off+on, try a different cable). The runbook's old `opkg install kmod-usb-net-rndis` step is obsolete: current OMR images use `apk`, and RNDIS is built-in to the Beryl AX kernel — `dmesg | tail` shows `rndis_host ... usb0: register 'rndis_host'` the moment tethering kicks in. No package install needed.
+
+## 6. Configure OMR (the "Wizard" is the Settings page)
+LuCI → **System → OpenMPTCProuter** (single Settings page — no separate Wizard in current builds).
+
+**Server settings:** paste Server IP + Server key from `vps-credentials.txt`. Username stays `openmptcprouter`. Default VPN = **Glorytun TCP**; also check **Shadowsocks**.
+
+**Interfaces — FIX THE DEFAULTS.** Stock `wan1`/`wan2` ship as **MacVLAN on `eth1`** (your LAN); nothing comes up like that. Per WAN block:
+
+| Field | Set to |
+|---|---|
+| Type | **Normal** (NOT MacVLAN) |
+| Protocol | **DHCP client** (NOT Static — Static needs IP+gateway) |
+| Physical interface | the **physical** name (`usb0`, `eth0`, `wwan`) — never a logical name like `wan1` (circular) |
+| Multipath TCP | **Master** for the most reliable WAN; **On** for the rest |
+| Enable SQM | ✅ for stable links (home/Starlink); ❌ for cellular (variable bandwidth) |
+
+For just-the-S25 build: one WAN block, Physical interface `usb0`, Master, SQM unchecked. Save & Apply, wait ~30s.
 
 ✅ **Checkpoint:**
 ```bash

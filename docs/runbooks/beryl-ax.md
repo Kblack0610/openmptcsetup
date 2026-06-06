@@ -10,7 +10,9 @@ Hardware:
 - Starlink Mini — primary WAN via ethernet
 - DigitalOcean SFO3 VPS — bonding endpoint (provisioned by `vps-create-do.sh`)
 
-R6S goes back in the box for now. You can swap to the R6S runbook (`RUNBOOK-R6S.md`) if you ever outgrow 2 WANs or need 1 Gbps+ encrypted bonded throughput.
+R6S goes back in the box for now. You can swap to the R6S runbook (`r6s.md` in this folder) if you ever outgrow 2 WANs or need 1 Gbps+ encrypted bonded throughput.
+
+> See also: `../concepts.md` for the *why* behind MPTCP/bonding/scheduler/role choices, and `../troubleshooting.md` for failure-mode lookups when something doesn't go green.
 
 ---
 
@@ -45,15 +47,15 @@ Beryl AX wizard in Phase 5.
 
 > **Region note:** SFO3 is correct even for the Alaska cruise. The VPS should sit near your
 > *destinations* (SoCal home/corp), not near your physical location; on a cruise the satellite
-> uplink latency dominates anyway, and DO's only US-West region is SFO. See `VPS-options.md`.
+> uplink latency dominates anyway, and DO's only US-West region is SFO. See `../vps-options.md`.
 
 > **Building from the ship?** Fine over **Starlink** (high ports open, no DPI). Avoid building
-> over **ship wifi** — it often blocks the high SSH/tunnel ports. See `CRUISE-CHECKLIST.md`.
+> over **ship wifi** — it often blocks the high SSH/tunnel ports. See `cruise-checklist.md` (sibling).
 
 ### Manual fallback (no doctl, or using Vultr/another provider)
 
 1. Deploy a **Debian 12 x64**, KVM, 1 vCPU / 1 GB instance with native public IPv4 + IPv6,
-   upload `~/.ssh/omr_vps.pub`. (Vultr LAX or DO SFO3 both work — see `VPS-options.md`.)
+   upload `~/.ssh/omr_vps.pub`. (Vultr LAX or DO SFO3 both work — see `../vps-options.md`.)
 2. Point the installer at it and let it do the rest:
 
 ```bash
@@ -154,53 +156,119 @@ If the Beryl AX doesn't come back after flashing:
 
 ```bash
 ssh root@192.168.100.1
+# Note: OMR's default root password is EMPTY on first boot — just press Enter at the prompt.
+# Set a password immediately: `passwd`
 
-# WAN port (2.5GbE) is eth1, LAN port (1GbE) is eth0
+# Map the physical ports to interface names — DO NOT ASSUME, the OMR default for
+# the Beryl AX is *opposite* of vanilla OpenWrt convention. In current OMR builds:
+#   eth1 = LAN (and is what carries 192.168.100.1 — qlen 2000 = 2.5GbE)
+#   eth0 = the spare/WAN-side port (qlen 1000 = 1GbE), starts DOWN until you cable home/Starlink into it
+# Verify with `ip link`:
 ip link
-# Expect: eth0 (LAN), eth1 (WAN), wlan0, wlan1 (the two Wi-Fi radios)
+# Expect: eth0 (DOWN until you plug into it), eth1 (UP with the LAN), wlan0, wlan1
 
-# Plug your S25 into the Beryl AX's USB 3.0 port (the rectangular USB-A on the back, NOT the USB-C power input)
+# Plug your phone into the USB-A 3.0 port (rectangular USB-A on the back, NOT USB-C power input)
 dmesg | tail -20
 lsusb
-# Expect: Samsung device entry
+# Expect: Samsung/OnePlus/Pixel device entry
 
-# Enable USB tethering on the S25
-# Settings → Connections → Mobile Hotspot and Tethering → USB tethering ON
+# Enable USB tethering on the phone (Settings → Connections → Mobile Hotspot and Tethering → USB tethering ON)
 dmesg | tail -10
 ip link show usb0
-# Expect: usb0 interface up with IP in 192.168.42.x
-
-# If usb0 doesn't appear:
-opkg update
-opkg install kmod-usb-net-rndis usbutils
-# Unplug/replug S25
+# Expect: usb0 interface EXISTS with a MAC but is `state DOWN` and has NO IP yet.
+# That is normal at this stage — OMR doesn't bring up or DHCP an unconfigured interface.
+# `usb0` will get a 192.168.42.x lease once you assign it as a WAN in Phase 5.
 ```
 
-**CHECKPOINT 3**: `usb0` exists with a DHCP-assigned IP. If not, don't proceed.
+> ### Heads-up: this OMR build uses `apk`, not `opkg`
+> Current OMR images switched from `opkg` to OpenWrt's new `apk` package manager — the login
+> banner tells you so. If the runbook's old `opkg install kmod-usb-net-rndis` would have been
+> needed (on older builds where RNDIS wasn't built-in), the modern equivalent is `apk add`.
+> But in practice **RNDIS is already in the kernel modules of the official Beryl AX image** —
+> dmesg will show `rndis_host ... usb0: register 'rndis_host'` automatically when you tether,
+> and no package install is needed. Skip the old `opkg` step entirely.
+
+**CHECKPOINT 3**: `usb0` exists in `ip link` output. Don't worry that it's DOWN with no IP —
+that gets fixed in Phase 5 when you wire it up as a WAN. If `usb0` is **missing entirely**, the
+tether isn't enumerating: check phone-side USB-tethering toggle, replug, or try a different cable.
 
 ---
 
-## Phase 5 — Wire WANs + run OMR wizard (~10 min)
+## Phase 5 — Wire WANs + configure OMR (~10 min)
 
-### 5.1 Physical
-- Starlink Mini → Beryl AX **WAN port** (2.5GbE)
-- S25 (USB tethering ON) → Beryl AX **USB 3.0 port**
-- Laptop → Beryl AX **LAN port**
+### 5.1 Physical wiring
+- **Laptop** → whichever Beryl AX ethernet port maps to `eth1` (the one with `192.168.100.1` — verified in Phase 4). Cable stays here for setup.
+- **Phone** (USB tethering ON) → Beryl USB-A 3.0 port (back of router, NOT the USB-C power input)
+- **Starlink Mini / home router uplink** → the OTHER physical ethernet port (maps to `eth0`)
 
-### 5.2 OMR wizard
+> **Port mapping caveat.** OMR's Beryl AX default makes the 2.5GbE port the LAN (`eth1`) and the
+> 1GbE port the WAN slot (`eth0`). Counterintuitive but harmless for current Starlink Mini
+> speeds (~200 Mbps caps well under 1GbE). If you ever need 2.5GbE on the WAN side, you'd
+> remap `eth0` ↔ `eth1` in `/etc/config/network` — but do that from a serial console because
+> the swap drops connectivity mid-change.
 
-LuCI → **System → OpenMPTCProuter → Wizard**:
+### 5.2 Open the OMR Settings page
 
+LuCI top nav → **System → OpenMPTCProuter** (URL: `http://192.168.100.1/cgi-bin/luci/admin/system/openmptcprouter`).
+
+> **Heads-up #1 — there's no separate "Wizard" page in this OMR version.** Older OMR docs
+> reference `System → OpenMPTCProuter → Wizard` as a guided form; current builds put all the
+> config on one long Settings page. You're not missing a page — scroll down.
+>
+> **Heads-up #2 — the dark theme + the kraken/ship wallpaper makes the form fields nearly
+> invisible** on first view. Fields are all there; it's just a CSS contrast issue. Highlight
+> or hover to see them.
+
+#### 5.2.1 Server settings block (top of the page)
 | Field | Value |
 |---|---|
-| Server IP | `<VPS_IP>` from Phase 1.2 |
-| Server Key | paste from `openmptcprouter_config.txt` |
-| Default VPN | `Glorytun TCP` |
+| Server IP | `<VPS_IP>` from `vps-credentials.txt` |
+| Server username | leave default (`openmptcprouter`) |
+| Server key | paste the long hex string from `vps-credentials.txt` (the `Server key`, not the `ADMIN API Server key`) |
+| Default VPN | Glorytun TCP |
 | Also enable | Shadowsocks (checkbox) |
-| wan1 interface | `eth1` (Starlink), Master, DHCP, enable SQM, enable MPTCP |
-| wan2 interface | `usb0` (S25), DHCP, enable MPTCP |
 
-Save & Apply. Wait ~30s for reload.
+#### 5.2.2 Interfaces settings block (scroll down) — **the OMR defaults are wrong, fix them**
+
+Out of the box, OMR ships `wan1` and `wan2` configured as **MacVLAN on `eth1`**. `eth1` is your
+LAN port, and MacVLAN is the wrong virtualization type for any single-WAN-per-physical-path
+setup. **You must change these or no WAN ever comes up.** Three fields per WAN block:
+
+| Field | Set to | Gotcha |
+|---|---|---|
+| **Type** | **Normal** | NOT MacVLAN. MacVLAN is for "multiple modems behind one VLAN-tagged switch on one port" (see `../concepts.md`). |
+| **Protocol** | **DHCP client** | NOT Static address (the default). Static requires an IP+gateway you don't have; DHCP gets them from your WAN source. |
+| **Physical interface** | the **physical** name (`eth0`, `usb0`, `wwan`) | The dropdown also lists *logical* names like `wan1`/`wan2`/`wan3` — picking `wan1` here creates a circular reference, the interface never binds, dashboard shows "No IP defined". Always pick a physical: `eth0`, `eth1`, `usb0`, `wwan`. |
+
+For a typical Beryl AX setup:
+
+| WAN slot | Physical interface | Multipath TCP | SQM | Why |
+|---|---|---|---|---|
+| `wan1` | **`eth0`** (Starlink / home uplink) | **Master** | ✅ enabled, fill in your real ↓/↑ Kb/s | Most reliable, biggest pipe. Master = initiates the MPTCP connection. |
+| `wan2` | **`usb0`** (cellular USB tether) | **On** (not Master) | unchecked | Cellular bandwidth is too variable for fixed-rate SQM. |
+| `wan3` (Add) | **`wwan`** (Wi-Fi-as-WAN to 2nd phone hotspot — Phase 9) | **On** | unchecked | Wi-Fi-as-WAN, only when 2nd phone in play. |
+
+> See `../concepts.md` for what **Master / On / Backup / Off** actually mean in MPTCP.
+
+Scroll to the bottom and click **Save & Apply**. Wait ~30 seconds.
+
+### 5.3 Scheduler tweak (per use case)
+
+```bash
+ssh root@192.168.100.1
+
+# VDI / remote desktop — survives a WAN dropping mid-stream, no combined throughput:
+uci set network.globals.mptcp_scheduler='redundant'
+
+# OR — bulk transfer / "combine internets" speeds, brief stall on link drop:
+# uci set network.globals.mptcp_scheduler='default'
+
+uci commit network
+/etc/init.d/network restart
+/etc/init.d/glorytun restart
+```
+
+See `../concepts.md` for the full scheduler comparison.
 
 ### 5.3 Scheduler tweak for VDI
 
@@ -213,19 +281,25 @@ uci commit network
 /etc/init.d/glorytun restart
 ```
 
-**CHECKPOINT 4**: LuCI → **OpenMPTCProuter → Status**:
+**CHECKPOINT 4**: LuCI → **Status → OpenMPTCProuter**:
 - VPS: green / reachable
-- wan1 (Starlink): green / connected
-- wan2 (usb0): green / connected
-- Glorytun tunnel: UP
-- Shadowsocks: running
+- wan1 (`eth0` / Starlink): green / connected
+- wan2 (`usb0` / cellular): green / connected
+- Glorytun tunnel: **UP** (not "VPN is not running")
+- Shadowsocks: **running** (not "empty key")
 
 SSH check:
 ```bash
-ip -s link show gt-tun0     # bytes incrementing
-ping -c 4 8.8.8.8
-curl -s ifconfig.me         # should return Vultr LAX IP
+ip -s link show gt-tun0     # bytes incrementing under load
+ping -c 4 8.8.8.8           # internet
+curl -s ifconfig.me         # MUST return your VPS public IP (not your local ISP IP)
 ```
+
+> **If you see "VPN is not running (empty key)" but the WAN is up:** OMR auto-fetches the per-VPN
+> keys (Glorytun, Shadowsocks, MLVPN) from the VPS admin API on port 65500 using your *Server
+> key* — but only once it has internet AND a Save & Apply has been triggered. Hit **Save &
+> Apply** again on the Settings page without changing anything; that re-runs the fetch. Wait
+> 30-60s, refresh the dashboard. See `../troubleshooting.md` for deeper diagnosis.
 
 ---
 
@@ -332,13 +406,20 @@ When you leave the cruise, just disable the 2.4GHz radio in LuCI to drop wan3.
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Stuck on GL.iNet after flash | Forgot to uncheck "Keep settings" | Reflash via U-Boot recovery (Phase 3.4) |
-| `usb0` doesn't appear after S25 tether | RNDIS driver missing | `opkg install kmod-usb-net-rndis` |
-| Glorytun tunnel won't establish | VPS firewall blocking 65001 | Check `ufw status` on VPS |
-| Cruise wifi blocks tunnel | DPI blocking UDP VPNs | Switch to Shadowsocks-only |
-| OnePlus on Beryl Wi-Fi can't reach internet | Wi-Fi network attached to wrong firewall zone | Wireless → edit SSID → Network = `lan` |
+| Can't log into LuCI / OMR after first boot | Empty default password not realized | Try `root` + **empty** password (just press Enter) |
+| Dashboard: "No IP defined" on a WAN | Physical interface dropdown set to a logical name (e.g. `wan1`) instead of a real one (`usb0`, `eth0`) | Re-edit the WAN block, pick a **physical** interface from the dropdown |
+| Dashboard: "VPN is not running (empty key)" but WAN is green | Per-VPN keys never auto-fetched from VPS | Click **Save & Apply** on Settings page again (re-triggers fetch). Wait 30-60s. |
+| WAN IPv4 fields highlighted red on save | Protocol left as **Static address** (default) with no IP supplied | Change Protocol to **DHCP client** — red fields disappear |
+| wan1/wan2 default to MacVLAN, never connect | OMR's stock template assumes multi-modem-on-VLAN-switch topology | Set Type to **Normal**, Physical interface to a real one (`eth0` / `usb0` / `wwan`) |
+| `usb0` exists but DOWN / no IP | Interface unconfigured (normal pre-wizard) | Will come up automatically once assigned as a WAN; verify `ip addr show usb0` after Save & Apply |
+| `usb0` missing entirely after tether | Phone not in RNDIS mode / cable / port | Toggle USB-tethering off+on on phone; try different cable; for non-Samsung phones check USB mode = MTP can hide RNDIS |
+| `opkg: not found` error | Newer OMR build switched to **`apk`** package manager | Use `apk add <pkg>` instead; for Beryl AX, RNDIS is already built-in — skip the install |
+| Glorytun tunnel won't establish | VPS firewall blocking 65001, or per-VPN keys not fetched | Check `ufw`/`shorewall` on VPS; re-Save & Apply on Beryl to refetch keys |
+| Cruise/hotel wifi blocks tunnel | DPI blocking UDP VPNs / VPS high ports | Switch to Shadowsocks-only (Phase 9.4) |
+| Device on Beryl Wi-Fi can't reach internet | SSID attached to wrong firewall zone | Wireless → edit SSID → Network = `lan` |
 | Speed < 50% of single WAN | SQM wrong values | LuCI → Network → SQM, run wizard speedtest |
 | Tailscale stuck on DERP relay | Bypass UDP 41641 not active | Recheck ByPass rules, restart Tailscale |
-| VDI disconnects after a few min | Glorytun TCP + CGNAT NAT expiry (#2418) | Set keepalive in `/etc/config/glorytun` to 15s |
+| VDI disconnects after a few min | Glorytun TCP + CGNAT NAT expiry (upstream #2418) | Set keepalive in `/etc/config/glorytun` to 15s |
 
 ---
 
